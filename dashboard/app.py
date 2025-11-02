@@ -30,6 +30,8 @@ def load_data():
         return None, None, None, None
 
 historical, predictions, training_results, comparison = load_data()
+# Ensure datetime type
+historical['datetime_utc'] = pd.to_datetime(historical['datetime_utc'], errors='coerce')
 
 if historical is None:
     st.stop()
