@@ -6,7 +6,7 @@ on:
     types: [eda-completed]
   workflow_dispatch:  # Manual trigger
   schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight
+    - cron: '0 * * * *'  # Weekly on Sunday at midnight
 
 jobs:
   train-models:
