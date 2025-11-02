@@ -1,3 +1,16 @@
+Here is my requirements.txt:
+
+pandas==2.1.4
+numpy==1.26.4
+torch==2.2.2+cpu
+scikit-learn==1.3.2
+hopsworks==3.4.4
+streamlit==1.33.0
+matplotlib==3.8.0
+joblib==1.3.2
+
+
+'''
 # Core dependencies
 pandas==2.1.4
 numpy==1.26.2
@@ -30,3 +43,4 @@ streamlit==1.29.0
 # Other utilities
 joblib==1.3.2
 python-dotenv==1.0.0
+'''
