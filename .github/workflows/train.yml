@@ -28,7 +28,7 @@ jobs:
 
       - name: Run Training Pipeline
         run: |
-          python train.py
+          python scripts/training.py
 
       # Upload trained models
       - name: Upload Models
