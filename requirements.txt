@@ -1,12 +1,15 @@
 streamlit
-pandas==2.1.4
+pandas==2.2.3
 numpy
 scikit-learn
-joblib
 matplotlib
+joblib
 
-# CPU PyTorch
-torch==2.2.2+cpu -f https://download.pytorch.org/whl/torch_stable.html
+# Install CPU-only PyTorch correctly:
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+torchaudio==2.2.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 
 
