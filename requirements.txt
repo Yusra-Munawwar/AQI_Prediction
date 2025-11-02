@@ -4,6 +4,7 @@ numpy
 scikit-learn
 matplotlib
 joblib
+plotly
 
 # Install CPU-only PyTorch correctly:
 torch==2.2.2+cpu
