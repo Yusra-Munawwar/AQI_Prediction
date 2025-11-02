@@ -37,6 +37,7 @@ jobs:
         git config --local user.name "GitHub Action"
         git add data/
         git diff --quiet && git diff --staged --quiet || git commit -m "Update data - $(date +'%Y-%m-%d %H:%M:%S')"
+        git pull --rebase origin main
         git push
         
     - name: Trigger EDA workflow
