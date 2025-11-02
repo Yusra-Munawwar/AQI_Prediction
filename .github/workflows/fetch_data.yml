@@ -1,5 +1,7 @@
 # .github/workflows/fetch_data.yml
 name: 1. Fetch Data
+permissions:
+  contents: write
 
 on:
   schedule:
