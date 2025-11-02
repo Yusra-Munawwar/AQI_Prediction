@@ -1,5 +1,7 @@
 # .github/workflows/train.yml
 name: 3. Model Training
+permissions:
+  contents: write
 
 on:
   repository_dispatch:
