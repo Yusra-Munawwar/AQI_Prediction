@@ -26,6 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
+        pip install "hopsworks[python]"
         
     - name: Run EDA and upload to Hopsworks
       env:
