@@ -8,7 +8,7 @@ on:
     types: [eda-completed]
   workflow_dispatch:  # Manual trigger
   schedule:
-    - cron: '0 * * * *'  # Weekly on Sunday at midnight
+    - cron: '0 * * * *'  #Every hour
 
 jobs:
   train-models:
@@ -49,4 +49,5 @@ jobs:
         git config --local user.name "GitHub Action"
         git add models/ data/
         git diff --quiet && git diff --staged --quiet || git commit -m "Update trained models - $(date +'%Y-%m-%d %H:%M:%S')"
+        git pull --rebase origin main
         git push
