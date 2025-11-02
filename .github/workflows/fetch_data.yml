@@ -3,7 +3,7 @@ name: 1. Fetch Data
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # Every 2 hours
+    - cron: '0 * * * *'  # Every 2 hours
   workflow_dispatch:  # Manual trigger
 
 jobs:
