@@ -1,5 +1,7 @@
 # .github/workflows/eda.yml
 name: 2. EDA and Upload to Hopsworks
+permissions:
+  contents: write
 
 on:
   repository_dispatch:
