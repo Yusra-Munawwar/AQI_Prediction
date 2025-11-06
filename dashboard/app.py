@@ -121,9 +121,22 @@ def generate_future_predictions():
     historical = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
     df_clean = historical
     
-    # Load selected features
-    with open('selected_features.json', 'r') as f:
-        selected_features = json.load(f)
+    # Load selected features (handle .txt or .json)
+    features_path = 'data/selected_features.txt'
+    if os.path.exists(features_path):
+        with open(features_path, 'r') as f:
+            content = f.read().strip()
+            # Assume it's a JSON array; if plain list, wrap in []
+            if content.startswith('[') and content.endswith(']'):
+                selected_features = json.loads(content)
+            else:
+                # Fallback: split by comma or lines
+                selected_features = [feat.strip().strip("'\"") for feat in content.split(',') if feat.strip()]
+        print(f"✅ Loaded {len(selected_features)} selected features from {features_path}")
+    else:
+        # Fallback to common features if missing
+        selected_features = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co', 'nh3', 'hour', 'month', 'day_of_week', 'is_weekend']
+        st.warning(f"Selected features file not found at {features_path}. Using fallback features.")
     
     # Fetch forecast
     def fetch_forecast_pollutants(lat, lon, api_key):
