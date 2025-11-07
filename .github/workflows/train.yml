@@ -38,7 +38,7 @@ jobs:
           git config --local user.name "GitHub Action"
           
           # Fix date command with proper quoting
-          TIMESTAMP=$(date '+%Y-%'--%m-%d %H:%M UTC)
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
           
           git add data/ checkpoints/ best_models/ *.pkl *.npy *.pth *.json selected_features.json scaler.pkl || true
           
