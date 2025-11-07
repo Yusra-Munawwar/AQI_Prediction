@@ -838,11 +838,13 @@ def generate_future_predictions(df_feat, selected_features):
         })
         
         # 1. Linear Regression
-        print("  1️⃣ Linear Regression...")
+        # 1. Linear Regression
+        print(" 1️⃣ Linear Regression...")
         if not os.path.exists('linear_model.pkl'):
             raise FileNotFoundError("linear_model.pkl not found!")
         model1 = pickle.load(open('linear_model.pkl', 'rb'))
-        X_sm = sm.add_constant(X_future_scaled)
+        # Must add constant to match training (15 features + 1 → 16)
+        X_sm = sm.add_constant(X_future_scaled, has_constant='add')
         pred["Linear"] = model1.predict(X_sm)
         
         # 2. Polynomial
