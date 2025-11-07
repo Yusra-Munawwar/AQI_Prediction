@@ -228,45 +228,46 @@ def update_csv_with_realtime(df_existing, new_row):
     print("STEP 2: APPENDING REAL-TIME DATA")
     print("="*50)
 
-    # Check if the existing DataFrame contains the latest timestamp in the new row
+    # 1. Prepare new row timestamp: must be timezone-aware (UTC)
     new_row_dt_utc = pd.to_datetime(new_row['datetime_utc']).tz_localize('UTC')
 
     if not df_existing.empty:
-        # Check if the new row's timestamp is already present
-        df_existing['datetime_utc'] = pd.to_datetime(df_existing['datetime_utc'])
-        latest_existing_dt = df_existing['datetime_utc'].max().tz_localize('UTC')
+        # Ensure the existing column is correctly recognized as timezone-aware (UTC)
+        # It's usually already correct if saved/loaded properly, but we ensure the Series is tz-aware.
+        df_existing['datetime_utc'] = pd.to_datetime(df_existing['datetime_utc']).dt.tz_localize('UTC', errors='ignore')
         
-        # OWM historical data is typically hourly, but real-time might be a different timestamp.
+        # 2. Get the max existing timestamp. It is already TZ-aware. DO NOT call .tz_localize() again.
+        latest_existing_dt = df_existing['datetime_utc'].max() 
+
         # Check for exact or near-exact match to avoid duplicates (within 1 minute)
-        if (new_row_dt_utc - latest_existing_dt).total_seconds() < 60 and (new_row_dt_utc - latest_existing_dt).total_seconds() >= 0:
+        # Note: both timestamps are now guaranteed to be UTC-aware, allowing comparison.
+        time_difference = (new_row_dt_utc - latest_existing_dt).total_seconds()
+        
+        if time_difference < 60 and time_difference >= 0:
             print("⚠️ Real-time data timestamp is too close to the existing data's latest point. Skipping append to avoid duplicates.")
             return df_existing
         
-        # Check if new row is older than latest existing data point (could happen if historical data was fetched later)
         if new_row_dt_utc < latest_existing_dt:
-             print("⚠️ Real-time data timestamp is older than the existing data's latest point. Skipping append.")
+             print(f"⚠️ Real-time data timestamp ({new_row_dt_utc}) is older than the existing data's latest point ({latest_existing_dt}). Skipping append.")
              return df_existing
 
-    # Create new row DataFrame
+    # 3. Create new row DataFrame and ensure its datetime column is UTC-aware
     new_row_df = pd.DataFrame([new_row])
     new_row_df['datetime_utc'] = pd.to_datetime(new_row_df['datetime_utc']).dt.tz_localize('UTC')
     
-    # Align columns: ensure the new row has all columns from the existing DataFrame
-    # and reorder them to match before concatenation.
+    # Align columns: ... (rest of the logic remains the same)
     existing_cols = df_existing.columns.tolist()
     
     for col in existing_cols:
         if col not in new_row_df.columns:
             new_row_df[col] = np.nan
     
-    # Drop any columns in new_row_df that are not in df_existing (like the 'aqi' column from initial fetch)
-    # The existing historical DF created in Step 1 will contain 'aqi' column, so this is usually fine.
-    new_row_df = new_row_df[existing_cols]  # Reorder to match
+    new_row_df = new_row_df[existing_cols] 
 
     # Append
     df_updated = pd.concat([df_existing, new_row_df], ignore_index=True)
     
-    # Re-sort to be safe, though usually not needed if only appending
+    # Re-sort and drop duplicates
     df_updated = df_updated.sort_values(by='datetime_utc').drop_duplicates(subset=['datetime_utc'], keep='last')
     
     df_updated.to_csv(EXISTING_DATA_FILE, index=False)
