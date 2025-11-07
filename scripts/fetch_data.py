@@ -232,15 +232,24 @@ def update_csv_with_realtime(df_existing, new_row):
     new_row_dt_utc = pd.to_datetime(new_row['datetime_utc']).tz_localize('UTC')
 
     if not df_existing.empty:
+        # --- FIX APPLIED HERE ---
         # Ensure the existing column is correctly recognized as timezone-aware (UTC)
-        # It's usually already correct if saved/loaded properly, but we ensure the Series is tz-aware.
-        df_existing['datetime_utc'] = pd.to_datetime(df_existing['datetime_utc']).dt.tz_localize('UTC', errors='ignore')
+        # We must read it first, then explicitly set the dtype to be UTC-aware if it's currently naive,
+        # or just ensure it's a datetime object if it's already localized.
         
-        # 2. Get the max existing timestamp. It is already TZ-aware. DO NOT call .tz_localize() again.
+        # This line ensures the column is a datetime object
+        df_existing['datetime_utc'] = pd.to_datetime(df_existing['datetime_utc'])
+        
+        # If it's not timezone-aware (tz is None), localize it to UTC.
+        # This prevents the TypeError when it's already localized.
+        if df_existing['datetime_utc'].dt.tz is None:
+            df_existing['datetime_utc'] = df_existing['datetime_utc'].dt.tz_localize('UTC')
+        # --- END OF FIX ---
+        
+        # 2. Get the max existing timestamp. It is already TZ-aware.
         latest_existing_dt = df_existing['datetime_utc'].max() 
 
         # Check for exact or near-exact match to avoid duplicates (within 1 minute)
-        # Note: both timestamps are now guaranteed to be UTC-aware, allowing comparison.
         time_difference = (new_row_dt_utc - latest_existing_dt).total_seconds()
         
         if time_difference < 60 and time_difference >= 0:
@@ -255,7 +264,7 @@ def update_csv_with_realtime(df_existing, new_row):
     new_row_df = pd.DataFrame([new_row])
     new_row_df['datetime_utc'] = pd.to_datetime(new_row_df['datetime_utc']).dt.tz_localize('UTC')
     
-    # Align columns: ... (rest of the logic remains the same)
+    # ... (rest of the function remains the same)
     existing_cols = df_existing.columns.tolist()
     
     for col in existing_cols:
