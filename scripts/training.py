@@ -1,6 +1,7 @@
 """
 Complete AQI Prediction Model Training Pipeline
 Includes data fetching, preprocessing, model training, evaluation, and future forecasting
+FIXED: Consistent feature engineering for training and forecast data
 """
 import pandas as pd
 import numpy as np
@@ -97,13 +98,46 @@ def calc_us_aqi(row):
     
     return max(subs) if subs else 0
 
-def engineer_features(df):
-    """Add temporal features."""
+def engineer_features(df, is_forecast=False):
+    """Add temporal and derived features consistently for training and forecast."""
     df = df.copy()
+    
+    # Temporal features
     df['hour'] = df['datetime_utc'].dt.hour
     df['month'] = df['datetime_utc'].dt.month
     df['day_of_week'] = df['datetime_utc'].dt.dayofweek
     df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    
+    # Cyclical encodings
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    
+    # Aggregations
+    if 'pm2_5' in df.columns and 'pm10' in df.columns:
+        df['total_pm'] = df['pm2_5'] + df['pm10']
+    if all(col in df.columns for col in ['co', 'no2', 'o3', 'so2']):
+        df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
+    
+    # Interactions
+    if 'pm2_5' in df.columns and 'co' in df.columns:
+        df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
+    if 'no2' in df.columns and 'o3' in df.columns:
+        # Avoid division by zero
+        df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
+    
+    # Rolling averages (only for historical data with sufficient history)
+    if not is_forecast and len(df) > 3:
+        for col in ['pm2_5', 'pm10', 'co']:
+            if col in df.columns:
+                df[f'{col}_rolling_3h'] = df[col].rolling(window=3, min_periods=1).mean()
+    else:
+        # For forecast, use current values as proxy (no historical data available)
+        for col in ['pm2_5', 'pm10', 'co']:
+            if col in df.columns:
+                df[f'{col}_rolling_3h'] = df[col]
+    
     return df
 
 def calc_metrics(y_true, y_pred):
@@ -207,24 +241,6 @@ def prepare_data(df_feat):
         json.dump(selected_features, f)
     return (X_train, X_val, X_test, y_train, y_val, y_test,
             X_train_scaled, X_val_scaled, X_test_scaled, selected_features)
-
-# =============================================================================
-# METRICS CALCULATION
-# =============================================================================
-def calc_metrics(y_true, y_pred):
-    """Calculate MAE, RMSE, R², and MAPE"""
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-   
-    # Safe MAPE calculation
-    mask = y_true != 0
-    if np.any(mask):
-        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-    else:
-        mape = np.nan
-   
-    return mae, rmse, r2, mape
 
 # =============================================================================
 # CHECKPOINT MANAGEMENT FOR CONTINUOUS TRAINING
@@ -729,7 +745,7 @@ def generate_future_predictions(df_feat, selected_features):
     forecast_df = fetch_forecast_pollutants(LAT, LON, api_key)
     print(f"✅ Forecast pollutant data received: {forecast_df.shape[0]} hours")
     
-    # Clean & Feature Engineering
+    # Clean & Feature Engineering with is_forecast=True flag
     pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
     for col in pollutants:
         if col in forecast_df.columns and col in df_clean.columns:
@@ -737,7 +753,14 @@ def generate_future_predictions(df_feat, selected_features):
             forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
             forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
     
-    forecast_feat = engineer_features(forecast_df)
+    forecast_feat = engineer_features(forecast_df, is_forecast=True)
+    
+    # Ensure all selected features exist, fill missing with 0
+    for feature in selected_features:
+        if feature not in forecast_feat.columns:
+            print(f"⚠️ Missing feature '{feature}' in forecast data, filling with 0")
+            forecast_feat[feature] = 0
+    
     X_future = forecast_feat[selected_features].fillna(0).values
     X_future_scaled = joblib.load('scaler.pkl').transform(X_future)
     
