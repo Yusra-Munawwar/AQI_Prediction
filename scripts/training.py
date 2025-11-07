@@ -715,30 +715,52 @@ def generate_future_predictions(df_feat, selected_features):
     print("="*70)
     
     try:
+        # Verify inputs
+        print(f"📊 Historical data shape: {df_feat.shape}")
+        print(f"📊 Selected features ({len(selected_features)}): {selected_features}")
+        
         os.makedirs('data', exist_ok=True)
-        df_clean = df_feat  # Historical for cleaning
+        df_clean = df_feat.copy()  # Historical for cleaning (make a copy to be safe)
+        
+        # Verify required columns exist in historical data
+        required_pollutants = ['co', 'no2', 'o3', 'so2', 'pm2_5', 'pm10']
+        missing_from_history = [col for col in required_pollutants if col not in df_clean.columns]
+        if missing_from_history:
+            print(f"⚠️ Warning: Historical data missing columns: {missing_from_history}")
         
         # Fetch forecast pollutants
         def fetch_forecast_pollutants(lat, lon, api_key):
-            url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
-            r = requests.get(url)
-            r.raise_for_status()  # Raise error for bad status codes
-            data = r.json()
-            records = []
-            for item in data["list"]:
-                dt = datetime.fromtimestamp(item["dt"], tz=UTC)
-                comp = item["components"]
-                aqi_1_5 = item["main"]["aqi"]
-                temp_row = {"datetime_utc": dt, **comp}
-                usaqi = calc_us_aqi(pd.Series(temp_row))
-                usaqi = np.clip(usaqi, 0, 500)
-                records.append({
-                    "datetime_utc": dt,
-                    "aqi_api": aqi_1_5,
-                    "Actual_AQI": usaqi,  # For comparison (forecast-based "actual")
-                    **comp
-                })
-            return pd.DataFrame(records)
+            try:
+                url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
+                print(f"🌐 Fetching from: {url}")
+                r = requests.get(url, timeout=30)
+                r.raise_for_status()  # Raise error for bad status codes
+                data = r.json()
+                
+                if "list" not in data:
+                    raise ValueError(f"Unexpected API response format: {data}")
+                
+                records = []
+                for item in data["list"]:
+                    dt = datetime.fromtimestamp(item["dt"], tz=UTC)
+                    comp = item["components"]
+                    aqi_1_5 = item["main"]["aqi"]
+                    temp_row = {"datetime_utc": dt, **comp}
+                    usaqi = calc_us_aqi(pd.Series(temp_row))
+                    usaqi = np.clip(usaqi, 0, 500)
+                    records.append({
+                        "datetime_utc": dt,
+                        "aqi_api": aqi_1_5,
+                        "Actual_AQI": usaqi,  # For comparison (forecast-based "actual")
+                        **comp
+                    })
+                return pd.DataFrame(records)
+            except requests.exceptions.RequestException as e:
+                print(f"❌ API request failed: {e}")
+                raise
+            except Exception as e:
+                print(f"❌ Error parsing API response: {e}")
+                raise
         
         api_key = os.getenv("OWM_API_KEY")
         if not api_key:
@@ -750,15 +772,28 @@ def generate_future_predictions(df_feat, selected_features):
         print(f"✅ Forecast pollutant data received: {forecast_df.shape[0]} hours")
         print(f"📊 Forecast columns: {list(forecast_df.columns)}")
         
+        # Check for NaN/inf values in forecast
+        if forecast_df.isnull().any().any():
+            print(f"⚠️ Found NaN values in forecast data:")
+            print(forecast_df.isnull().sum()[forecast_df.isnull().sum() > 0])
+        
         # Clean & Feature Engineering with is_forecast=True flag
-        print("🔧 Cleaning and engineering features...")
+        print("🔧 Cleaning forecast data...")
         pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
         for col in pollutants:
-            if col in forecast_df.columns and col in df_clean.columns:
-                forecast_df[col] = forecast_df[col].clip(lower=0)
-                forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
-                forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
+            if col in forecast_df.columns:
+                if col in df_clean.columns:
+                    median_val = df_clean[col].median()
+                    quantile_val = df_clean[col].quantile(0.995)
+                    print(f"  {col}: median={median_val:.2f}, 99.5%={quantile_val:.2f}")
+                    forecast_df[col] = forecast_df[col].clip(lower=0)
+                    forecast_df[col] = forecast_df[col].fillna(median_val)
+                    forecast_df[col] = forecast_df[col].clip(upper=quantile_val)
+                else:
+                    print(f"  ⚠️ {col}: not in historical data, using fallback")
+                    forecast_df[col] = forecast_df[col].clip(lower=0).fillna(0)
         
+        print("🔧 Engineering features for forecast data...")
         forecast_feat = engineer_features(forecast_df, is_forecast=True)
         print(f"✅ Feature engineering complete. Shape: {forecast_feat.shape}")
         print(f"📊 Engineered columns: {list(forecast_feat.columns)}")
@@ -781,7 +816,16 @@ def generate_future_predictions(df_feat, selected_features):
         X_future = forecast_feat[selected_features].fillna(0).values
         print(f"✅ X_future shape: {X_future.shape}")
         
+        # Check for NaN/inf in feature matrix
+        if np.isnan(X_future).any():
+            nan_count = np.isnan(X_future).sum()
+            print(f"⚠️ Warning: {nan_count} NaN values in X_future, replacing with 0")
+            X_future = np.nan_to_num(X_future, nan=0.0, posinf=0.0, neginf=0.0)
+        
         print("📏 Loading scaler and transforming data...")
+        if not os.path.exists('scaler.pkl'):
+            raise FileNotFoundError("scaler.pkl not found! Training may have failed.")
+        
         scaler = joblib.load('scaler.pkl')
         X_future_scaled = scaler.transform(X_future)
         print(f"✅ X_future_scaled shape: {X_future_scaled.shape}")
@@ -795,18 +839,25 @@ def generate_future_predictions(df_feat, selected_features):
         
         # 1. Linear Regression
         print("  1️⃣ Linear Regression...")
+        if not os.path.exists('linear_model.pkl'):
+            raise FileNotFoundError("linear_model.pkl not found!")
         model1 = pickle.load(open('linear_model.pkl', 'rb'))
         X_sm = sm.add_constant(X_future_scaled)
         pred["Linear"] = model1.predict(X_sm)
         
         # 2. Polynomial
         print("  2️⃣ Polynomial Regression...")
+        if not os.path.exists('poly_coeffs.npy'):
+            raise FileNotFoundError("poly_coeffs.npy not found!")
         coeffs = np.load('poly_coeffs.npy')
         pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
         pred["Polynomial"] = np.polyval(coeffs, X_future_scaled[:, pm2_idx])
         
         # 3. PyTorch Linear
         print("  3️⃣ PyTorch Linear...")
+        if not os.path.exists('linear_model.pth'):
+            raise FileNotFoundError("linear_model.pth not found!")
+            
         class LinearModel(nn.Module):
             def __init__(self, n): 
                 super().__init__()
@@ -822,6 +873,9 @@ def generate_future_predictions(df_feat, selected_features):
         
         # 4. PyTorch MLP
         print("  4️⃣ PyTorch MLP...")
+        if not os.path.exists('mlp_model.pth'):
+            raise FileNotFoundError("mlp_model.pth not found!")
+            
         class MLP(nn.Module):
             def __init__(self, n):
                 super().__init__()
@@ -840,17 +894,23 @@ def generate_future_predictions(df_feat, selected_features):
         
         # 5. GB
         print("  5️⃣ Gradient Boosting...")
+        if not os.path.exists('gb_model.pkl'):
+            raise FileNotFoundError("gb_model.pkl not found!")
         gb = joblib.load("gb_model.pkl")
         pred["GB"] = gb.predict(X_future)
         
         # 6. XGB
         print("  6️⃣ XGBoost...")
+        if not os.path.exists('xgb_model.json'):
+            raise FileNotFoundError("xgb_model.json not found!")
         xg = xgb.XGBRegressor()
         xg.load_model("xgb_model.json")
         pred["XGB"] = xg.predict(X_future)
         
         # 7. RF
         print("  7️⃣ Random Forest...")
+        if not os.path.exists('rf_model.pkl'):
+            raise FileNotFoundError("rf_model.pkl not found!")
         rf = joblib.load("rf_model.pkl")
         pred["RF"] = rf.predict(X_future)
         
@@ -918,6 +978,11 @@ if __name__ == "__main__":
     
     # Fetch data
     df_feat = fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_training=True)
+    
+    # Apply feature engineering to historical data FIRST (before prepare_data uses it)
+    print("\n🔧 Applying feature engineering to historical data...")
+    df_feat = engineer_features(df_feat, is_forecast=False)
+    print(f"✅ Historical data with features: {df_feat.shape}")
    
     # Prepare data
     (X_train, X_val, X_test, y_train, y_val, y_test,
