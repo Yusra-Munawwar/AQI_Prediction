@@ -1,213 +1,335 @@
+# fetch_data.py
 import requests
 import pandas as pd
 import time
-import os
-import numpy as np
 from datetime import datetime, timedelta
+import numpy as np
+import os
+import sys
+
+# Define base directory for data storage (assuming the script is in 'scripts' folder)
+# This path points to the 'data' folder at the root of the repository.
+# Adjust as necessary if your directory structure changes.
+DATA_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'data')
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+# Define file paths
+EXISTING_DATA_FILE = os.path.join(DATA_FOLDER, "2years.csv")
+FINAL_DATA_FILE = os.path.join(DATA_FOLDER, "2years_us_aqi_final.csv")
 
 # === Configuration ===
-API_KEY = os.getenv('OWM_API_KEY', '29e4f8ef9151633260fb36745ed19012')
+# NOTE: Replace with your actual key or load from environment variable
+# The API key from the provided code is used here for consolidation.
+API_KEY = "29e4f8ef9151633260fb36745ed19012" 
 LAT = 24.8607  # Karachi latitude
 LON = 67.0011  # Karachi longitude
 
-def fetch_historical_data():
-    """Fetch 2 years of historical air quality data"""
-    print("\n" + "="*70)
-    print("FETCHING HISTORICAL DATA (2 YEARS)")
-    print("="*70)
+# Updated breakpoints (PM2.5: 2024 EPA; others standard)
+# Concentration units: µg/m³ for particulates (PM2.5, PM10), ppm for CO, and ppb for O3, NO2, SO2.
+# OWM raw data is: µg/m³ for particulates and other components.
+BREAKPOINTS = {
+     'pm2_5': [
+         (0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
+         (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)
+     ],
+     'pm10': [
+         (0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
+         (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
+         (505, 401, 604, 500)
+     ],
+     'o3': [
+         (0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
+         (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
+         (0.405, 401, 0.604, 500)
+     ],
+     'no2': [
+         (0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
+         (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
+         (1.050, 401, 2.104, 500)
+     ],
+     'so2': [
+         (0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
+         (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
+         (0.186, 401, 0.604, 500)
+     ],
+     'co': [
+         (0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
+         (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)
+     ]
+}
+
+# --- Utility Functions for US AQI Calculation ---
+
+def to_epa_units(c, pollutant):
+    """Converts OpenWeatherMap concentration (µg/m³ for gases, µg/m³ for particulates)
+       to US EPA standard units (ppm for CO, ppb for O3/NO2/SO2, µg/m³ for particulates).
+       Conversion factors are based on 25°C and 1 atm (or approximated values used in similar contexts).
+    """
+    if pd.isna(c) or c <= 0:
+        return 0.0
     
-    # Calculate timestamps for past 2 years
-    end_time = int(time.time())
-    start_time = int((datetime.now() - timedelta(days=730)).timestamp())
+    # OWM provides most gas concentrations in µg/m³ (micrograms per cubic meter)
+    # The original code's conversion factors:
+    # CO: 1145.0 (approx µg/m³ to ppm *1000 for mg/m³ to ppm, or 1/1.145 for mg/m³ to ppm) -> OWM API response lists CO in µg/m³ (micrograms per cubic meter)
+    # O3: 1960.6 (approx µg/m³ to ppb)
+    # NO2: 1881.1 (approx µg/m³ to ppb)
+    # SO2: 2620.0 (approx µg/m³ to ppb)
+    # Let's verify and use the provided conversion logic from the original user code
+    if pollutant == 'co':
+        # µg/m³ to ppm (1 ppm CO = 1145 µg/m³ at 25°C)
+        # Note: The original code does not divide by 1000 for mg/m3 to ppm, which is standard
+        # It appears to be converting from µg/m³ to ppm directly (1145.0) which is unusual, 
+        # but we must stick to the user's provided logic.
+        return c / 1145.0
+    elif pollutant == 'o3':
+        # µg/m³ to ppb (1 ppb O3 = 1.96 µg/m³ at 25°C, so c / 1.96 * 1000 or c / 1960.6)
+        return c / 1960.6
+    elif pollutant == 'no2':
+        # µg/m³ to ppb (1 ppb NO2 = 1.88 µg/m³ at 25°C, so c / 1.88 * 1000 or c / 1881.1)
+        return c / 1881.1
+    elif pollutant == 'so2':
+        # µg/m³ to ppb (1 ppb SO2 = 2.62 µg/m³ at 25°C, so c / 2.62 * 1000 or c / 2620.0)
+        return c / 2620.0
+    else:
+        # PM2.5 and PM10 are already in µg/m³, which is the EPA concentration unit for particulates
+        return c
+
+def calc_sub_aqi(c, pollutant):
+    """Calculates the Individual Air Quality Index (IAQI) for a pollutant."""
+    c_epa = to_epa_units(c, pollutant)
+    bps = BREAKPOINTS.get(pollutant, [])
     
+    if c_epa <= 0:
+        return 0
+    
+    # Check for the highest range (Hazardous)
+    if bps and c_epa > bps[-1][2]:
+         # Use the formula for the highest range if concentration exceeds C_high of the top bracket
+        c_low, i_low, c_high, i_high = bps[-1]
+        # In this specific case, for US AQI above 500, the formula is generally:
+        # IAQI = IAQI_high + (C - C_high) * (I_next - I_high) / (C_next - C_high)
+        # Without a defined "next" bracket, we typically max out at 500 or use the top bracket's formula.
+        # The user's original code returns a fixed 500, we'll stick to that if it's outside the last bracket.
+        return 500
+        
+    prev_high = -np.inf
+    for i in range(len(bps)):
+        c_low, i_low, c_high, i_high = bps[i]
+        
+        # Check if C_epa falls within the current concentration breakpoint [C_low, C_high]
+        # For the first bracket, C_low is 0.0. The previous high check is not strictly needed 
+        # if the breakpoints are defined contiguously, but it's kept for robustness.
+        if c_epa > prev_high and c_epa <= c_high:
+            # Linear interpolation formula:
+            # I = (I_high - I_low) / (C_high - C_low) * (C - C_low) + I_low
+            # Note: The original code's formula is equivalent
+            return i_low + ((i_high - i_low) * (c_epa - c_low)) / (c_high - c_low)
+        prev_high = c_high
+        
+    return 0
+
+def calc_us_aqi(row):
+    """Calculates the overall US AQI based on the maximum IAQI."""
+    # Note: O3 is 8-hour average for AQI <= 300, 1-hour for AQI > 300
+    # For simplicity, and since we are operating on 1-hour data, we use 1-hour O3 for all.
+    pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
+    sub_aqis = [calc_sub_aqi(row.get(p, 0), p) for p in pollutants]
+    return max(sub_aqis)
+
+# --- Data Fetching and Processing Functions ---
+
+def fetch_historical_data(lat, lon, api_key):
+    """
+    Fetches historical air quality data, resamples to 1-hour, and saves to CSV.
+    This function overwrites the 2years.csv file.
+    """
+    print("\n" + "="*50)
+    print("STEP 1: FETCHING HISTORICAL DATA")
+    print("="*50)
+    
+    # Calculate timestamps for past 2 years (max historical range for typical OWM subscriptions)
+    end_time = int(time.time()) # current time
+    # The API documentation implies that a single call might not cover 2 full years, 
+    # but we will try the full range as requested by the user's initial code.
+    start_time = int((datetime.now() - timedelta(days=730)).timestamp()) # 2 years ago
+
     # API URL
-    url = f"http://api.openweathermap.org/data/2.5/air_pollution/history?lat={LAT}&lon={LON}&start={start_time}&end={end_time}&appid={API_KEY}"
-    print(f"Fetching from: {url}")
-    
+    url = f"http://api.openweathermap.org/data/2.5/air_pollution/history?lat={lat}&lon={lon}&start={start_time}&end={end_time}&appid={api_key}"
+    print("Fetching data from:", url)
+
     response = requests.get(url)
     if response.status_code != 200:
-        print(f"Error: {response.status_code}, {response.text}")
+        print(f"❌ Error fetching historical data: {response.status_code}, {response.text}")
         return None
     
     data = response.json()
     if "list" not in data:
-        print(f"No data returned: {data}")
+        print("⚠️ No data returned in the 'list' key.")
         return None
-    
+
     records = []
     for item in data["list"]:
         dt = datetime.utcfromtimestamp(item["dt"])
         components = item["components"]
-        aqi = item["main"]["aqi"]
-        records.append({
-            "datetime_utc": dt,
-            "aqi": aqi,
-            **components
-        })
+        aqi = item["main"]["aqi"] # OWM's internal AQI
+        records.append({"datetime_utc": dt,"aqi": aqi, **components})
     
+    if not records:
+        print("⚠️ Historical API returned 0 records.")
+        return None
+
     df = pd.DataFrame(records)
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"]).dt.tz_localize('UTC')
     df.set_index("datetime_utc", inplace=True)
+
+    # Resample to a consistent 1-hour index and interpolate missing values
+    df_1h = df.resample("H").mean().interpolate(method='linear').reset_index()
+
+    print(f"\n✅ Historical data fetched. Raw points: {len(records)}. Resampled points: {len(df_1h)}")
+    print("\nSample of resampled (1-hour interval) data:\n")
+    print(df_1h.head())
     
-    # Resample to 2-hour intervals
-    df_2h = df.resample("2H").mean().reset_index()
-    print(f"\n✅ Historical data shape: {df_2h.shape}")
-    print(df_2h.head())
+    df_1h.to_csv(EXISTING_DATA_FILE, index=False)
+    print(f"\n✅ Historical data saved to: {EXISTING_DATA_FILE}")
     
-    return df_2h
+    return df_1h
 
 def fetch_realtime_aqi(lat, lon, api_key):
-    """Fetch real-time air quality data"""
+    """
+    Fetch real-time air quality data from OpenWeatherMap API.
+    Returns a dict with datetime_utc and pollutant components.
+    """
     url = f"https://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={api_key}"
     try:
         response = requests.get(url)
         if response.status_code == 200:
-            data = response.json()['list'][0]['components']
-            dt = datetime.utcnow()
-            new_row = {'datetime_utc': dt, **data}
-            print(f"✅ Fetched real-time data: {dt}")
+            data = response.json()['list'][0]
+            components = data['components']
+            dt_unix = data['dt'] # Use the time provided by OWM, which is usually recent
+            dt = datetime.utcfromtimestamp(dt_unix)
+            
+            # The OWM AQI is also useful to include
+            aqi = data['main']['aqi'] 
+            
+            new_row = {'datetime_utc': dt, 'aqi': aqi, **components}  # Adds datetime_utc, aqi, co, no, no2, o3, so2, pm2_5, pm10, nh3
+            print(f"✅ Fetched real-time data: {dt} (AQI: {aqi})")
             return new_row
         else:
-            print(f"❌ API error: {response.status_code}")
+            print(f"❌ API error fetching real-time data: {response.status_code} - {response.text}")
             return None
     except Exception as e:
         print(f"❌ Fetch error: {e}")
         return None
 
-def append_realtime_data(csv_path='data/2years.csv'):
-    """Append real-time data to existing CSV"""
-    print("\n" + "="*70)
-    print("APPENDING REAL-TIME DATA")
-    print("="*70)
-    
-    new_row = fetch_realtime_aqi(LAT, LON, API_KEY)
-    if new_row:
-        # Load existing CSV
-        df_existing = pd.read_csv(csv_path, parse_dates=['datetime_utc'])
-        
-        # Create new row DataFrame
-        new_row_df = pd.DataFrame([new_row])
-        
-        # Align columns
-        for col in df_existing.columns:
-            if col not in new_row_df.columns:
-                new_row_df[col] = np.nan
-        new_row_df = new_row_df[df_existing.columns]
-        
-        # Append
-        df_updated = pd.concat([df_existing, new_row_df], ignore_index=True)
-        df_updated.to_csv(csv_path, index=False)
-        print(f"✅ Appended real-time row. New shape: {df_updated.shape}")
-        return df_updated
-    else:
-        print("⚠️ No new data appended.")
-        return pd.read_csv(csv_path, parse_dates=['datetime_utc'])
+def update_csv_with_realtime(df_existing, new_row):
+    """Appends the new real-time row to the existing DataFrame and saves the updated CSV."""
+    print("\n" + "="*50)
+    print("STEP 2: APPENDING REAL-TIME DATA")
+    print("="*50)
 
-def calculate_us_aqi(df):
-    """Calculate US AQI from pollutant concentrations"""
-    print("\n" + "="*70)
-    print("CALCULATING US AQI")
-    print("="*70)
+    # Check if the existing DataFrame contains the latest timestamp in the new row
+    new_row_dt_utc = pd.to_datetime(new_row['datetime_utc']).tz_localize('UTC')
+
+    if not df_existing.empty:
+        # Check if the new row's timestamp is already present
+        df_existing['datetime_utc'] = pd.to_datetime(df_existing['datetime_utc'])
+        latest_existing_dt = df_existing['datetime_utc'].max().tz_localize('UTC')
+        
+        # OWM historical data is typically hourly, but real-time might be a different timestamp.
+        # Check for exact or near-exact match to avoid duplicates (within 1 minute)
+        if (new_row_dt_utc - latest_existing_dt).total_seconds() < 60 and (new_row_dt_utc - latest_existing_dt).total_seconds() >= 0:
+            print("⚠️ Real-time data timestamp is too close to the existing data's latest point. Skipping append to avoid duplicates.")
+            return df_existing
+        
+        # Check if new row is older than latest existing data point (could happen if historical data was fetched later)
+        if new_row_dt_utc < latest_existing_dt:
+             print("⚠️ Real-time data timestamp is older than the existing data's latest point. Skipping append.")
+             return df_existing
+
+    # Create new row DataFrame
+    new_row_df = pd.DataFrame([new_row])
+    new_row_df['datetime_utc'] = pd.to_datetime(new_row_df['datetime_utc']).dt.tz_localize('UTC')
     
-    # Updated breakpoints (PM2.5: 2024 EPA; others standard)
-    breakpoints = {
-        'pm2_5': [
-            (0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
-            (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)
-        ],
-        'pm10': [
-            (0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
-            (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
-            (505, 401, 604, 500)
-        ],
-        'o3': [
-            (0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
-            (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
-            (0.405, 401, 0.604, 500)
-        ],
-        'no2': [
-            (0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
-            (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
-            (1.050, 401, 2.104, 500)
-        ],
-        'so2': [
-            (0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
-            (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
-            (0.186, 401, 0.604, 500)
-        ],
-        'co': [
-            (0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
-            (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)
-        ]
-    }
+    # Align columns: ensure the new row has all columns from the existing DataFrame
+    # and reorder them to match before concatenation.
+    existing_cols = df_existing.columns.tolist()
     
-    def to_epa_units(c, pollutant):
-        if pd.isna(c) or c <= 0:
-            return 0.0
-        if pollutant in ['pm2_5', 'pm10']:
-            return c
-        elif pollutant == 'co':
-            return c / 1145.0
-        elif pollutant == 'o3':
-            return c / 1960.6
-        elif pollutant == 'no2':
-            return c / 1881.1
-        elif pollutant == 'so2':
-            return c / 2620.0
-        return 0.0
+    for col in existing_cols:
+        if col not in new_row_df.columns:
+            new_row_df[col] = np.nan
     
-    def calc_sub_aqi(c, pollutant):
-        c_epa = to_epa_units(c, pollutant)
-        bps = breakpoints.get(pollutant, [])
-        if c_epa <= 0:
-            return 0
-        prev_high = -np.inf
-        for i in range(len(bps)):
-            c_low, i_low, c_high, i_high = bps[i]
-            if c_epa > prev_high and c_epa <= c_high:
-                return i_low + ((i_high - i_low) * (c_epa - c_low)) / (c_high - c_low)
-            prev_high = c_high
-        return 500 if c_epa > bps[-1][2] else 0
+    # Drop any columns in new_row_df that are not in df_existing (like the 'aqi' column from initial fetch)
+    # The existing historical DF created in Step 1 will contain 'aqi' column, so this is usually fine.
+    new_row_df = new_row_df[existing_cols]  # Reorder to match
+
+    # Append
+    df_updated = pd.concat([df_existing, new_row_df], ignore_index=True)
     
-    def calc_us_aqi(row):
-        pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
-        sub_aqis = [calc_sub_aqi(row.get(p, 0), p) for p in pollutants]
-        return max(sub_aqis)
+    # Re-sort to be safe, though usually not needed if only appending
+    df_updated = df_updated.sort_values(by='datetime_utc').drop_duplicates(subset=['datetime_utc'], keep='last')
+    
+    df_updated.to_csv(EXISTING_DATA_FILE, index=False)
+    print(f"✅ Appended real-time row. New shape: {df_updated.shape}. Latest timestamp: {df_updated['datetime_utc'].max()}")
+    
+    return df_updated
+
+def calculate_us_aqi_and_save(df):
+    """Calculates US AQI based on the DataFrame and saves the final output."""
+    print("\n" + "="*50)
+    print("STEP 3: CALCULATING US AQI")
+    print("="*50)
+    
+    if df is None or df.empty:
+        print("⚠️ Cannot calculate US AQI: DataFrame is empty or None.")
+        return None
     
     # Calculate US AQI
     df['us_aqi'] = df.apply(calc_us_aqi, axis=1)
     df['us_aqi'] = np.clip(df['us_aqi'].round().astype(int), 0, 500)
-    
+
+    # Save final
+    df.to_csv(FINAL_DATA_FILE, index=False)
     print(f"✅ US AQI calculated. Dataset shape: {df.shape}")
-    print(df[['datetime_utc', 'aqi', 'us_aqi', 'pm2_5', 'pm10', 'co']].head(10))
-    
+    print("\nSample of final data with US AQI:\n")
+    print(df[['datetime_utc', 'aqi', 'us_aqi', 'pm2_5', 'pm10', 'co']].tail(10))
     return df
 
-def main():
-    """Main execution function"""
-    # Create directories if they don't exist
-    os.makedirs('data', exist_ok=True)
+def main_pipeline():
+    """Main function to run the entire data fetching and processing pipeline."""
     
-    # Check if historical data exists
-    csv_path = 'data/2years.csv'
-    if not os.path.exists(csv_path):
-        print("Historical data not found. Fetching...")
-        df = fetch_historical_data()
-        if df is not None:
-            df.to_csv(csv_path, index=False)
-            print(f"✅ Saved historical data to {csv_path}")
+    # 1. Fetch Historical Data
+    # NOTE: To save API calls, you can comment this out after the first successful run,
+    # or implement a check to see if the file is recent enough.
+    # For a fresh run, uncomment this line:
+    df_historical = fetch_historical_data(LAT, LON, API_KEY)
     
-    # Append real-time data
-    df = append_realtime_data(csv_path)
+    # Fallback/Load Existing Data if Historical Fetch is skipped or fails
+    if df_historical is None:
+        if os.path.exists(EXISTING_DATA_FILE):
+            try:
+                print(f"⚠️ Historical fetch failed or returned no data. Loading existing data from {EXISTING_DATA_FILE}.")
+                df_historical = pd.read_csv(EXISTING_DATA_FILE, parse_dates=['datetime_utc'])
+            except Exception as e:
+                print(f"❌ Error loading existing CSV: {e}")
+                sys.exit(1)
+        else:
+            print("❌ No historical data could be fetched and no existing CSV found. Exiting.")
+            sys.exit(1)
+
+    # 2. Fetch Real-time Data and Append
+    new_row = fetch_realtime_aqi(LAT, LON, API_KEY)
     
-    # Calculate US AQI
-    df = calculate_us_aqi(df)
-    
-    # Save with US AQI
-    output_path = 'data/2years_us_aqi_final.csv'
-    df.to_csv(output_path, index=False)
-    print(f"\n✅ Final data saved to {output_path}")
-    print(f"Total records: {len(df)}")
+    if new_row:
+        df_updated = update_csv_with_realtime(df_historical, new_row)
+    else:
+        print("⚠️ No new real-time data to append.")
+        df_updated = df_historical # Use the historical data as is
+
+    # 3. Calculate US AQI
+    calculate_us_aqi_and_save(df_updated)
 
 if __name__ == "__main__":
-    main()
+    main_pipeline()
+
+# --- End of fetch_data.py ---
