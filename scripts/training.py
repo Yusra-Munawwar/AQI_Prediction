@@ -1,6 +1,6 @@
 """
 Complete AQI Prediction Model Training Pipeline
-Includes data fetching, preprocessing, model training, and evaluation
+Includes data fetching, preprocessing, model training, evaluation, and future forecasting
 """
 import pandas as pd
 import numpy as np
@@ -20,8 +20,106 @@ import hopsworks
 import os
 import warnings
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+import requests
+
 warnings.filterwarnings('ignore')
+
+# Constants for Karachi
+LAT = 24.8607
+LON = 67.0011
+
+# UTC
+UTC = timezone.utc
+
+# AQI Breakpoints (from EPA Technical Assistance Document)
+breakpoints = {
+    'pm2_5': [(0.0, 12.0, 0, 50), (12.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+              (55.5, 150.4, 151, 200), (150.5, 250.4, 201, 300), (250.5, 350.4, 301, 400),
+              (350.5, 500.4, 401, 500)],
+    'pm10': [(0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150),
+             (255, 354, 151, 200), (355, 424, 201, 300), (425, 504, 301, 400),
+             (505, 604, 401, 500)],
+    'o3': [(0.000, 0.054, 0, 50), (0.055, 0.070, 51, 100), (0.071, 0.085, 101, 150),
+           (0.086, 0.105, 151, 200), (0.106, 0.200, 201, 300)],
+    'no2': [(0, 53, 0, 50), (54, 100, 51, 100), (101, 360, 101, 150),
+            (361, 649, 151, 200), (650, 1249, 201, 300), (1250, 1649, 301, 400),
+            (1650, 2049, 401, 500)],
+    'so2': [(0, 35, 0, 50), (36, 75, 51, 100), (76, 185, 101, 150),
+            (186, 304, 151, 200), (305, 604, 201, 300), (605, 804, 301, 400),
+            (805, 1004, 401, 500)],
+    'co': [(0.0, 4.4, 0, 50), (4.5, 9.4, 51, 100), (9.5, 12.4, 101, 150),
+           (12.5, 15.4, 151, 200), (15.5, 30.4, 201, 300), (30.5, 40.4, 301, 400),
+           (40.5, 50.4, 401, 500)]
+}
+
+def linear_aqi(c, breaks):
+    """Linear interpolation for AQI sub-index."""
+    for cl, ch, il, ih in breaks:
+        if cl <= c <= ch:
+            if ch == cl:
+                return il
+            return il + (ih - il) * (c - cl) / (ch - cl)
+    return min(500, max(0, c))  # Clamp to 0-500
+
+def calc_us_aqi(row):
+    """Calculate US AQI as max of sub-indices for major pollutants."""
+    subs = []
+    pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
+    
+    # PM2.5 (μg/m³)
+    if 'pm2_5' in row:
+        subs.append(linear_aqi(row['pm2_5'], breakpoints['pm2_5']))
+    
+    # PM10 (μg/m³)
+    if 'pm10' in row:
+        subs.append(linear_aqi(row['pm10'], breakpoints['pm10']))
+    
+    # O3 (μg/m³ to ppm)
+    if 'o3' in row:
+        c_ppm = row['o3'] / 1960.0
+        subs.append(linear_aqi(c_ppm, breakpoints['o3']))
+    
+    # NO2 (μg/m³ to ppb)
+    if 'no2' in row:
+        c_ppb = row['no2'] * (24.45 / 46.0)  # ≈0.532 * μg/m³
+        subs.append(linear_aqi(c_ppb, breakpoints['no2']))
+    
+    # SO2 (μg/m³ to ppb)
+    if 'so2' in row:
+        c_ppb = row['so2'] * (24.45 / 64.0)  # ≈0.382 * μg/m³
+        subs.append(linear_aqi(c_ppb, breakpoints['so2']))
+    
+    # CO (mg/m³ to ppm)
+    if 'co' in row:
+        c_ppm = row['co'] / 1.145
+        subs.append(linear_aqi(c_ppm, breakpoints['co']))
+    
+    return max(subs) if subs else 0
+
+def engineer_features(df):
+    """Add temporal features."""
+    df = df.copy()
+    df['hour'] = df['datetime_utc'].dt.hour
+    df['month'] = df['datetime_utc'].dt.month
+    df['day_of_week'] = df['datetime_utc'].dt.dayofweek
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    return df
+
+def calc_metrics(y_true, y_pred):
+    """Calculate MAE, RMSE, R², and MAPE"""
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+   
+    # Safe MAPE calculation
+    mask = y_true != 0
+    if np.any(mask):
+        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+    else:
+        mape = np.nan
+   
+    return mae, rmse, r2, mape
 
 # =============================================================================
 # SECTION 1: FETCH DATA FROM HOPSWORKS
@@ -173,7 +271,7 @@ def load_best_checkpoint(model_class, model_name, input_dim):
         print(f"⚠️ No best checkpoint found for {model_name}, using fresh model.")
         return None
 
-def compare_and_save_best_results(results_summary, prev_path='previous_best_results.csv', current_path='training_results.csv'):
+def compare_and_save_best_results(results_summary, prev_path='previous_best_results.csv', current_path='data/training_results.csv'):
     """
     Compare new training results with previous best to prevent degradation in continuous training.
     Save the better one (higher max Test R²) to the current path.
@@ -585,17 +683,164 @@ def train_all_models(X_train, X_val, X_test, y_train, y_val, y_test,
     if not is_new_best:
         print("📝 Results summary not updated in training_results.csv (keeping previous best).")
     else:
-        results_summary.to_csv('training_results.csv', index=False)
         print("\n✅ Training complete! Checkpoints saved in 'checkpoints/' directory.")
    
     return results
 
 # =============================================================================
+# SECTION 4: FUTURE AQI PREDICTION
+# =============================================================================
+def generate_future_predictions(df_feat, selected_features):
+    """
+    Generate future AQI predictions using trained models and save CSVs.
+    """
+    print("\n" + "="*70)
+    print("SECTION 4: FUTURE AQI PREDICTION USING FORECAST POLLUTANTS")
+    print("="*70)
+    
+    os.makedirs('data', exist_ok=True)
+    df_clean = df_feat  # Historical for cleaning
+    
+    # Fetch forecast pollutants
+    def fetch_forecast_pollutants(lat, lon, api_key):
+        url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
+        r = requests.get(url).json()
+        records = []
+        for item in r["list"]:
+            dt = datetime.fromtimestamp(item["dt"], tz=UTC)
+            comp = item["components"]
+            aqi_1_5 = item["main"]["aqi"]
+            temp_row = {"datetime_utc": dt, **comp}
+            usaqi = calc_us_aqi(pd.Series(temp_row))
+            usaqi = np.clip(usaqi, 0, 500)
+            records.append({
+                "datetime_utc": dt,
+                "aqi_api": aqi_1_5,
+                "Actual_AQI": usaqi,  # For comparison (forecast-based "actual")
+                **comp
+            })
+        return pd.DataFrame(records)
+    
+    api_key = os.getenv("OWM_API_KEY")
+    if not api_key:
+        print("⚠️ OWM_API_KEY not set. Skipping forecast generation.")
+        return
+    
+    forecast_df = fetch_forecast_pollutants(LAT, LON, api_key)
+    print(f"✅ Forecast pollutant data received: {forecast_df.shape[0]} hours")
+    
+    # Clean & Feature Engineering
+    pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
+    for col in pollutants:
+        if col in forecast_df.columns and col in df_clean.columns:
+            forecast_df[col] = forecast_df[col].clip(lower=0)
+            forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
+            forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
+    
+    forecast_feat = engineer_features(forecast_df)
+    X_future = forecast_feat[selected_features].fillna(0).values
+    X_future_scaled = joblib.load('scaler.pkl').transform(X_future)
+    
+    # Predictions
+    pred = pd.DataFrame({
+        "datetime_utc": forecast_df["datetime_utc"],
+        "Actual_AQI": forecast_df["Actual_AQI"].astype(float)
+    })
+    
+    # 1. Linear Regression
+    model1 = pickle.load(open('linear_model.pkl', 'rb'))
+    X_sm = sm.add_constant(X_future_scaled)
+    pred["Linear"] = model1.predict(X_sm)
+    
+    # 2. Polynomial
+    coeffs = np.load('poly_coeffs.npy')
+    pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
+    pred["Polynomial"] = np.polyval(coeffs, X_future_scaled[:, pm2_idx])
+    
+    # 3. PyTorch Linear
+    class LinearModel(nn.Module):
+        def __init__(self, n): super().__init__(); self.linear = nn.Linear(n, 1)
+        def forward(self, x): return self.linear(x)
+    
+    m3 = LinearModel(len(selected_features))
+    m3.load_state_dict(torch.load("linear_model.pth"))
+    m3.eval()
+    pred["PyTorch_Linear"] = m3(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
+    
+    # 4. PyTorch MLP
+    class MLP(nn.Module):
+        def __init__(self, n):
+            super().__init__()
+            self.fc1 = nn.Linear(n, 64); self.fc2 = nn.Linear(64, 32); self.fc3 = nn.Linear(32, 1)
+            self.r = nn.ReLU()
+        def forward(self, x): return self.fc3(self.r(self.fc2(self.r(self.fc1(x)))))
+    
+    m4 = MLP(len(selected_features))
+    m4.load_state_dict(torch.load("mlp_model.pth"))
+    m4.eval()
+    pred["PyTorch_MLP"] = m4(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
+    
+    # 5. GB
+    gb = joblib.load("gb_model.pkl")
+    pred["GB"] = gb.predict(X_future)
+    
+    # 6. XGB
+    xg = xgb.XGBRegressor()
+    xg.load_model("xgb_model.json")
+    pred["XGB"] = xg.predict(X_future)
+    
+    # 7. RF
+    rf = joblib.load("rf_model.pkl")
+    pred["RF"] = rf.predict(X_future)
+    
+    # Ensemble
+    pred["Ensemble"] = pred[['Linear', 'Polynomial', 'PyTorch_Linear', 'PyTorch_MLP', 'GB', 'XGB', 'RF']].mean(axis=1)
+    
+    # Clip
+    for col in pred.columns[2:]:
+        pred[col] = np.clip(pred[col], 0, 500)
+    
+    # Closest Model
+    model_cols = pred.columns.drop(["datetime_utc", "Actual_AQI"])
+    pred["Closest_Model"] = (pred[model_cols].sub(pred["Actual_AQI"], axis=0).abs().idxmin(axis=1))
+    
+    # Summary Metrics
+    model_map = {
+        'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear',
+        'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost',
+        'RF': 'Random Forest', 'Ensemble': 'Ensemble'
+    }
+    model_cols = [col for col in pred.columns if col not in ['datetime_utc', 'Actual_AQI', 'Closest_Model']]
+    summary_data = []
+    y_true = pred['Actual_AQI']
+    for model_col in model_cols:
+        if model_col in model_map:
+            y_pred = pred[model_col]
+            mae, rmse, r2, mape = calc_metrics(y_true, y_pred)
+            summary_data.append({
+                'Model': model_map[model_col], 'MAE': mae, 'RMSE': rmse, 'R²': r2, 'MAPE': mape
+            })
+    comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
+    
+    # Save to data/
+    pred.to_csv("data/future_aqi_predictions.csv", index=False)
+    comparison_summary.to_csv("data/future_prediction_comparison.csv", index=False)
+    
+    print("💾 Saved: data/future_aqi_predictions.csv")
+    print("💾 Saved: data/future_prediction_comparison.csv")
+    
+    print("\n📊 Sample Output:")
+    print(pred.head(10))
+    print("\n📊 Forecast Performance Summary:")
+    print(comparison_summary)
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 if __name__ == "__main__":
-    # Create checkpoints directory
+    # Create directories
     os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('data', exist_ok=True)
     
     # Fetch data
     df_feat = fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_training=True)
@@ -610,8 +855,11 @@ if __name__ == "__main__":
         X_train_scaled, X_val_scaled, X_test_scaled, selected_features
     )
    
+    # Generate future predictions
+    generate_future_predictions(df_feat, selected_features)
+   
     print("\n" + "="*70)
-    print("✅ TRAINING PIPELINE COMPLETE!")
+    print("✅ FULL PIPELINE COMPLETE! (Training + Forecasting)")
     print("="*70)
     print("\nSaved Models (using best checkpoints where applicable):")
     print(" - linear_model.pkl")
@@ -623,7 +871,9 @@ if __name__ == "__main__":
     print(" - rf_model.pkl")
     print(" - scaler.pkl")
     print(" - selected_features.json")
-    print(" - training_results.csv (best across runs)")
+    print(" - data/training_results.csv (best across runs)")
+    print(" - data/future_aqi_predictions.csv")
+    print(" - data/future_prediction_comparison.csv")
     print(" - Checkpoints in 'checkpoints/' for resuming/inspection")
 
 
