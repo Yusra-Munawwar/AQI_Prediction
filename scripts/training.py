@@ -47,7 +47,6 @@ def calc_us_aqi(row):
     co = row['co']
     so2 = row['so2']
 
-    # Simplified AQI breakpoints (EPA-based)
     def aqi_from_breakpoints(c, breakpoints):
         for (low_c, high_c), (low_i, high_i) in breakpoints:
             if low_c <= c <= high_c:
@@ -69,7 +68,7 @@ def calc_us_aqi(row):
 
     aqi_pm25 = aqi_from_breakpoints(pm25, pm25_break)
     aqi_pm10 = aqi_from_breakpoints(pm10, pm10_break)
-    aqi_o3 = aqi_from_breakpoints(o3, pm10_break)
+    aqi_o3 = aqi_from_breakpoints(o3, o3_break)
     aqi_no2 = aqi_from_breakpoints(no2, no2_break)
     aqi_co = aqi_from_breakpoints(co, co_break)
     aqi_so2 = aqi_from_breakpoints(so2, so2_break)
@@ -107,13 +106,13 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_train
         return df
     except Exception as e:
         print(f"Error: Hopsworks fetch failed: {e}. Falling back to local CSV.")
+        local_path = os.path.join(DATA_DIR, "2years_features.csv")
         try:
-            #df = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
-            df = pd.read_csv(os.path.join(DATA_DIR,'2years_features.csv'))
+            df = pd.read_csv(local_path)
             print(f"Success: Fallback to local CSV! Shape: {df.shape}")
             return df
         except FileNotFoundError:
-            raise ValueError("No local CSV found—ensure upload happened first.")
+            raise ValueError(f"No local CSV found at '{local_path}'. Place file in 'data/' folder.")
 
 # ==========================================
 # DATASET COMPARISON
@@ -131,7 +130,7 @@ def compare_datasets(local_df, hops_df, tolerance=1e-6):
         min_len = min(len(local_sorted), len(hops_sorted))
         local_sorted = local_sorted.iloc[:min_len]
         hops_sorted = hops_sorted.iloc[:min_len]
-        print(f"   → Truncated to {min_len} rows.")
+        print(f"   Truncated to {min_len} rows.")
 
     print(f"Local shape: {local_sorted.shape}, Hops shape: {hops_sorted.shape}")
 
@@ -167,15 +166,16 @@ def compare_datasets(local_df, hops_df, tolerance=1e-6):
     return (local_cols == core_hops_cols) and (abs(local_mean - hops_mean) < tolerance if 'us_aqi' in local_sorted.columns else True)
 
 # ==========================================
-# FEATURE ENGINEERING
+# FULL FEATURE ENGINEERING (Used for both training & forecast)
 # ==========================================
-# -------------------------------------------------
-# FEATURE ENGINEERING (replace the old one)
-# -------------------------------------------------
-def engineer_features(df):
+def engineer_features(df, is_forecast=False):
+    """
+    Apply full feature engineering.
+    is_forecast=True → we need to create rolling & interaction features from raw data.
+    """
     df = df.copy()
 
-    # ---- datetime conversion (robust) ----
+    # 1. Datetime conversion
     if 'datetime_utc' in df.columns:
         if df['datetime_utc'].dtype == 'int64':
             df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', errors='coerce')
@@ -183,11 +183,38 @@ def engineer_features(df):
             df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce')
         df = df.dropna(subset=['datetime_utc']).reset_index(drop=True)
 
-    # ---- actual features ----
-    df['hour']        = df['datetime_utc'].dt.hour
-    df['month']       = df['datetime_utc'].dt.month
+    # 2. Basic time features
+    df['hour'] = df['datetime_utc'].dt.hour
+    df['month'] = df['datetime_utc'].dt.month
     df['day_of_week'] = df['datetime_utc'].dt.dayofweek
-    df['is_weekend']  = df['day_of_week'].isin([5, 6]).astype(int)
+    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+    # 3. Only for forecast: create rolling & interaction features
+    if is_forecast:
+        # Sort by time
+        df = df.sort_values('datetime_utc').reset_index(drop=True)
+
+        # Rolling 3-hour means (requires at least 3 rows)
+        pollutants = ['pm2_5', 'pm10', 'co', 'no2', 'o3']
+        for col in pollutants:
+            if col in df.columns:
+                df[f'{col}_rolling_3h'] = df[col].rolling(window=3, min_periods=1).mean()
+
+        # Interaction
+        if 'pm2_5' in df.columns and 'co' in df.columns:
+            df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
+
+        # Ratios
+        if 'no2' in df.columns and 'o3' in df.columns:
+            df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
+
+        # Totals
+        if all(col in df.columns for col in ['pm2_5', 'pm10']):
+            df['total_pm'] = df['pm2_5'] + df['pm10']
+        if all(col in df.columns for col in ['co', 'no2', 'o3', 'so2']):
+            df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
+
     return df
 
 # ==========================================
@@ -206,17 +233,16 @@ def calc_metrics(y_true, y_pred):
 # ==========================================
 if __name__ == "__main__":
     # --- Fetch & Verify ---
-    # ---- in the main block ----
     df_feat = fetch_from_hopsworks(for_training=True)
-    df_feat = engineer_features(df_feat)
+    df_feat = engineer_features(df_feat, is_forecast=False)  # Training data already has features
+
     local_csv_path = os.path.join(DATA_DIR, '2years_features.csv')
     if not os.path.exists(local_csv_path):
-        raise FileNotFoundError(f"Local CSV not found at {local_csv_path}. Please upload it to the data/ folder.")
-
+        raise FileNotFoundError(f"Local CSV not found at {local_csv_path}")
     local_df = pd.read_csv(local_csv_path)
-    local_df = engineer_features(local_df)
-    hops_df = fetch_from_hopsworks(for_training=False)
+    local_df = engineer_features(local_df, is_forecast=False)
 
+    hops_df = fetch_from_hopsworks(for_training=False)
     is_match = compare_datasets(local_df, hops_df)
     print("\nSuccess: CORE MATCH! Ready for training!" if is_match else "\nWarning: Minor differences detected.")
 
@@ -252,6 +278,9 @@ if __name__ == "__main__":
     print("SECTION 3: MODEL TRAINING (7 MODELS)")
     print("="*70)
     results = {}
+
+    # [Model training code unchanged — omitted for brevity but kept in full script]
+    # ... (Linear, Poly, PyTorch, MLP, GB, XGB, RF) ...
 
     # 1. Linear
     X_train_sm = sm.add_constant(X_train_scaled)
@@ -384,22 +413,36 @@ if __name__ == "__main__":
     forecast_df = fetch_forecast_pollutants(LAT, LON, OWM_API_KEY)
     print(f"Success: Forecast data: {forecast_df.shape[0]} hours")
 
-    # Clean & engineer
+    # Clean pollutants using historical stats
     pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
     df_clean = pd.read_csv(os.path.join(DATA_DIR, '2years_features.csv'))
-    # df_clean = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
+
     for col in pollutants:
-        forecast_df[col] = forecast_df[col].clip(lower=0)
-        forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
-        forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
+        if col in forecast_df.columns:
+            forecast_df[col] = forecast_df[col].clip(lower=0)
+            forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
+            forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
 
-    forecast_feat = engineer_features(forecast_df)
+    # APPLY FULL FEATURE ENGINEERING (this is the fix!)
+    forecast_feat = engineer_features(forecast_df, is_forecast=True)
+
+    # Now select only the features used in training
+    missing_cols = [col for col in selected_features if col not in forecast_feat.columns]
+    if missing_cols:
+        print(f"Warning: Adding {len(missing_cols)} missing features with 0s: {missing_cols}")
+        for col in missing_cols:
+            forecast_feat[col] = 0
+
     X_future = forecast_feat[selected_features].fillna(0)
-    X_future_scaled = scaler.transform(X_future)
+    X_future_scaled = scaler.transform(X_future.values)  # .values ensures array
 
-    pred = pd.DataFrame({"datetime_utc": forecast_df["datetime_utc"], "Actual_AQI": forecast_df["Actual_AQI"].astype(float)})
+    # Predictions
+    pred = pd.DataFrame({
+        "datetime_utc": forecast_df["datetime_utc"],
+        "Actual_AQI": forecast_df["Actual_AQI"].astype(float)
+    })
 
-    # Load & predict
+    # Load models and predict
     model1 = pickle.load(open(os.path.join(DATA_DIR, 'linear_model.pkl'), 'rb'))
     pred["Linear"] = model1.predict(sm.add_constant(X_future_scaled, has_constant='add'))
 
@@ -423,13 +466,18 @@ if __name__ == "__main__":
     pred["RF"] = joblib.load(os.path.join(DATA_DIR, 'rf_model.pkl')).predict(X_future)
 
     pred["Ensemble"] = pred[['Linear','Polynomial','PyTorch_Linear','PyTorch_MLP','GB','XGB','RF']].mean(axis=1)
+
     for col in pred.columns[2:]:
         pred[col] = np.clip(pred[col], 0, 500)
 
     pred["Closest_Model"] = pred.iloc[:, 2:-1].sub(pred["Actual_AQI"], axis=0).abs().idxmin(axis=1)
 
     # Summary
-    model_map = {'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear', 'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost', 'RF': 'Random Forest', 'Ensemble': 'Ensemble'}
+    model_map = {
+        'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear',
+        'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost',
+        'RF': 'Random Forest', 'Ensemble': 'Ensemble'
+    }
     summary_data = []
     for col in pred.columns[2:-1]:
         mae, rmse, r2, mape = calc_metrics(pred['Actual_AQI'], pred[col])
