@@ -4,6 +4,4 @@ models/
 *.npy
 *.json
 
-data/*_predictions.csv
-data/training_results.csv
-data/future_prediction_comparison.csv
+
