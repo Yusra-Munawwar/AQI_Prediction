@@ -108,7 +108,7 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_train
     except Exception as e:
         print(f"Error: Hopsworks fetch failed: {e}. Falling back to local CSV.")
         try:
-            df = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
+            df = pd.read_csv('/data/2years_features.csv', parse_dates=['datetime_utc'])
             print(f"Success: Fallback to local CSV! Shape: {df.shape}")
             return df
         except FileNotFoundError:
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     df_feat = fetch_from_hopsworks(for_training=True)
     df_feat = engineer_features(df_feat)
 
-    local_df = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
+    local_df = pd.read_csv('/data/2years_features.csv', parse_dates=['datetime_utc'])
     local_df = engineer_features(local_df)
     hops_df = fetch_from_hopsworks(for_training=False)
     is_match = compare_datasets(local_df, hops_df)
@@ -332,7 +332,7 @@ if __name__ == "__main__":
         'Test MAPE (%)': v['test_mape'],
         'CV R²': v.get('cv_r2', np.nan)
     } for v in results.values()]).sort_values('Test R²', ascending=False)
-    summary_df.to_csv(os.path.join(DATA_DIR, 'training_results.csv'), index=False)
+    summary_df.to_csv(os.path.join(DATA_DIR, '/data/training_results.csv'), index=False)
     print(summary_df)
 
     # ==========================================
@@ -367,7 +367,7 @@ if __name__ == "__main__":
 
     # Clean & engineer
     pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
-    df_clean = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
+    df_clean = pd.read_csv('/data/2years_features.csv', parse_dates=['datetime_utc'])
     for col in pollutants:
         forecast_df[col] = forecast_df[col].clip(lower=0)
         forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
@@ -417,8 +417,8 @@ if __name__ == "__main__":
     comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
 
     # Save
-    pred.to_csv(os.path.join(DATA_DIR, "future_aqi_predictions.csv"), index=False)
-    comparison_summary.to_csv(os.path.join(DATA_DIR, "future_prediction_comparison.csv"), index=False)
+    pred.to_csv(os.path.join(DATA_DIR, "/data/future_aqi_predictions.csv"), index=False)
+    comparison_summary.to_csv(os.path.join(DATA_DIR, "/data/future_prediction_comparison.csv"), index=False)
     print("Success: Saved: future_aqi_predictions.csv, future_prediction_comparison.csv, training_results.csv")
 
     print("\nSample Predictions:")
