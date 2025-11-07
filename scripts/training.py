@@ -288,6 +288,7 @@ def load_best_checkpoint(model_class, model_name, input_dim):
         return None
 
 def compare_and_save_best_results(results_summary, prev_path='previous_best_results.csv', current_path='data/training_results.csv'):
+    os.makedirs('data', exist_ok=True)
     """
     Compare new training results with previous best to prevent degradation in continuous training.
     Save the better one (higher max Test R²) to the current path.
