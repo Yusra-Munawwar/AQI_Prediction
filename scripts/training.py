@@ -109,7 +109,7 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_train
         print(f"Error: Hopsworks fetch failed: {e}. Falling back to local CSV.")
         try:
             #df = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
-            df = pd.read_csv(os.path.join(DATA_DIR,'2years_features.csv') 
+            df = pd.read_csv(os.path.join(DATA_DIR,'2years_features.csv'))
             print(f"Success: Fallback to local CSV! Shape: {df.shape}")
             return df
         except FileNotFoundError:
