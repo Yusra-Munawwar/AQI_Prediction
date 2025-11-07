@@ -108,7 +108,8 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_train
     except Exception as e:
         print(f"Error: Hopsworks fetch failed: {e}. Falling back to local CSV.")
         try:
-            df = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
+            #df = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
+            df = pd.read_csv(os.path.join(DATA_DIR,'2years_features.csv') 
             print(f"Success: Fallback to local CSV! Shape: {df.shape}")
             return df
         except FileNotFoundError:
@@ -168,12 +169,25 @@ def compare_datasets(local_df, hops_df, tolerance=1e-6):
 # ==========================================
 # FEATURE ENGINEERING
 # ==========================================
+# -------------------------------------------------
+# FEATURE ENGINEERING (replace the old one)
+# -------------------------------------------------
 def engineer_features(df):
     df = df.copy()
-    df['hour'] = df['datetime_utc'].dt.hour
-    df['month'] = df['datetime_utc'].dt.month
+
+    # ---- datetime conversion (robust) ----
+    if 'datetime_utc' in df.columns:
+        if df['datetime_utc'].dtype == 'int64':
+            df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', errors='coerce')
+        elif df['datetime_utc'].dtype == 'object':
+            df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce')
+        df = df.dropna(subset=['datetime_utc']).reset_index(drop=True)
+
+    # ---- actual features ----
+    df['hour']        = df['datetime_utc'].dt.hour
+    df['month']       = df['datetime_utc'].dt.month
     df['day_of_week'] = df['datetime_utc'].dt.dayofweek
-    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['is_weekend']  = df['day_of_week'].isin([5, 6]).astype(int)
     return df
 
 # ==========================================
@@ -192,12 +206,17 @@ def calc_metrics(y_true, y_pred):
 # ==========================================
 if __name__ == "__main__":
     # --- Fetch & Verify ---
+    # ---- in the main block ----
     df_feat = fetch_from_hopsworks(for_training=True)
     df_feat = engineer_features(df_feat)
+    local_csv_path = os.path.join(DATA_DIR, '2years_features.csv')
+        if not os.path.exists(local_csv_path):
+           raise FileNotFoundError(f"Local CSV not found at {local_csv_path}. Please upload it to the data/ folder.")
 
-    local_df = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
+    local_df = pd.read_csv(local_csv_path)
     local_df = engineer_features(local_df)
     hops_df = fetch_from_hopsworks(for_training=False)
+
     is_match = compare_datasets(local_df, hops_df)
     print("\nSuccess: CORE MATCH! Ready for training!" if is_match else "\nWarning: Minor differences detected.")
 
@@ -332,7 +351,7 @@ if __name__ == "__main__":
         'Test MAPE (%)': v['test_mape'],
         'CV R²': v.get('cv_r2', np.nan)
     } for v in results.values()]).sort_values('Test R²', ascending=False)
-    summary_df.to_csv(os.path.join(DATA_DIR, 'data/training_results.csv'), index=False)
+    summary_df.to_csv(os.path.join(DATA_DIR, 'training_results.csv'), index=False)
     print(summary_df)
 
     # ==========================================
@@ -367,7 +386,8 @@ if __name__ == "__main__":
 
     # Clean & engineer
     pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
-    df_clean = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
+    df_clean = pd.read_csv(os.path.join(DATA_DIR, '2years_features.csv'))
+    # df_clean = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
     for col in pollutants:
         forecast_df[col] = forecast_df[col].clip(lower=0)
         forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
@@ -417,8 +437,8 @@ if __name__ == "__main__":
     comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
 
     # Save
-    pred.to_csv(os.path.join(DATA_DIR, "data/future_aqi_predictions.csv"), index=False)
-    comparison_summary.to_csv(os.path.join(DATA_DIR, "data/future_prediction_comparison.csv"), index=False)
+    pred.to_csv(os.path.join(DATA_DIR, "future_aqi_predictions.csv"), index=False)
+    comparison_summary.to_csv(os.path.join(DATA_DIR, "future_prediction_comparison.csv"), index=False)
     print("Success: Saved: future_aqi_predictions.csv, future_prediction_comparison.csv, training_results.csv")
 
     print("\nSample Predictions:")
