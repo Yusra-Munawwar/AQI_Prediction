@@ -1,19 +1,18 @@
 name: 3. Train AQI Models
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # every hour
-
+    - cron: "0 * * * *" # every hour
 jobs:
   train:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1   # no full history needed
+          fetch-depth: 1  # Shallow clone; fine for commits
+          token: ${{ secrets.GITHUB_TOKEN }}  # Use GITHUB_TOKEN for push auth
+          persist-credentials: true  # Keep credentials for git push
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,16 +22,28 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_training.txt --extra-index-url https://download.pytorch.org/whl/cpu      
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements_training.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Run Training Pipeline
         env:
-            HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          OWM_API_KEY: ${{ secrets.OWM_API_KEY }}  # Add this for forecasts in training.py
         run: python scripts/training.py
-     
 
-      # Upload trained models
+      # Commit and push updated CSVs to repo
+      - name: Commit Updated Files
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/  # Stage all changes in data/
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update training results and forecasts [$(date +%Y-%m-%d %H:%M UTC)]"
+            git push
+          fi
+
+      # Upload trained models (keep for manual downloads)
       - name: Upload Models
         uses: actions/upload-artifact@v4
         with:
@@ -47,7 +58,7 @@ jobs:
             rf_model.pkl
             models/
 
-      # Upload evaluation results (CSV outputs)
+      # Upload evaluation results (keep for manual downloads)
       - name: Upload Results Data
         uses: actions/upload-artifact@v4
         with:
