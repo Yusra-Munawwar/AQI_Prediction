@@ -6,13 +6,15 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write    # Required to push changes
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # Shallow clone; fine for commits
-          token: ${{ secrets.GITHUB_TOKEN }}  # Use GITHUB_TOKEN for push auth
-          persist-credentials: true  # Keep credentials for git push
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,23 +29,26 @@ jobs:
       - name: Run Training Pipeline
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          OWM_API_KEY: ${{ secrets.OWM_API_KEY }}  # Add this for forecasts in training.py
+          OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
         run: python scripts/training.py
 
-      # Commit and push updated CSVs to repo
       - name: Commit Updated Files
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add data/  # Stage all changes in data/
+          
+          # Fix date command with proper quoting
+          TIMESTAMP=$(date '+%Y-%'--%m-%d %H:%M UTC)
+          
+          git add data/ checkpoints/ best_models/ *.pkl *.npy *.pth *.json selected_features.json scaler.pkl || true
+          
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update training results and forecasts [$(date +%Y-%m-%d %H:%M UTC)]"
-            git push
+            git commit -m "Update training results and forecasts [$TIMESTAMP]"
+            git push origin HEAD:main
           fi
 
-      # Upload trained models (keep for manual downloads)
       - name: Upload Models
         uses: actions/upload-artifact@v4
         with:
@@ -57,8 +62,11 @@ jobs:
             xgb_model.json
             rf_model.pkl
             models/
+            checkpoints/
+            best_models/
+            scaler.pkl
+            selected_features.json
 
-      # Upload evaluation results (keep for manual downloads)
       - name: Upload Results Data
         uses: actions/upload-artifact@v4
         with:
