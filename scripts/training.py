@@ -714,148 +714,199 @@ def generate_future_predictions(df_feat, selected_features):
     print("SECTION 4: FUTURE AQI PREDICTION USING FORECAST POLLUTANTS")
     print("="*70)
     
-    os.makedirs('data', exist_ok=True)
-    df_clean = df_feat  # Historical for cleaning
-    
-    # Fetch forecast pollutants
-    def fetch_forecast_pollutants(lat, lon, api_key):
-        url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
-        r = requests.get(url).json()
-        records = []
-        for item in r["list"]:
-            dt = datetime.fromtimestamp(item["dt"], tz=UTC)
-            comp = item["components"]
-            aqi_1_5 = item["main"]["aqi"]
-            temp_row = {"datetime_utc": dt, **comp}
-            usaqi = calc_us_aqi(pd.Series(temp_row))
-            usaqi = np.clip(usaqi, 0, 500)
-            records.append({
-                "datetime_utc": dt,
-                "aqi_api": aqi_1_5,
-                "Actual_AQI": usaqi,  # For comparison (forecast-based "actual")
-                **comp
-            })
-        return pd.DataFrame(records)
-    
-    api_key = os.getenv("OWM_API_KEY")
-    if not api_key:
-        print("⚠️ OWM_API_KEY not set. Skipping forecast generation.")
-        return
-    
-    forecast_df = fetch_forecast_pollutants(LAT, LON, api_key)
-    print(f"✅ Forecast pollutant data received: {forecast_df.shape[0]} hours")
-    
-    # Clean & Feature Engineering with is_forecast=True flag
-    pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
-    for col in pollutants:
-        if col in forecast_df.columns and col in df_clean.columns:
-            forecast_df[col] = forecast_df[col].clip(lower=0)
-            forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
-            forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
-    
-    forecast_feat = engineer_features(forecast_df, is_forecast=True)
-    
-    # Ensure all selected features exist, fill missing with 0
-    for feature in selected_features:
-        if feature not in forecast_feat.columns:
-            print(f"⚠️ Missing feature '{feature}' in forecast data, filling with 0")
-            forecast_feat[feature] = 0
-    
-    X_future = forecast_feat[selected_features].fillna(0).values
-    X_future_scaled = joblib.load('scaler.pkl').transform(X_future)
-    
-    # Predictions
-    pred = pd.DataFrame({
-        "datetime_utc": forecast_df["datetime_utc"],
-        "Actual_AQI": forecast_df["Actual_AQI"].astype(float)
-    })
-    
-    # 1. Linear Regression
-    model1 = pickle.load(open('linear_model.pkl', 'rb'))
-    X_sm = sm.add_constant(X_future_scaled)
-    pred["Linear"] = model1.predict(X_sm)
-    
-    # 2. Polynomial
-    coeffs = np.load('poly_coeffs.npy')
-    pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
-    pred["Polynomial"] = np.polyval(coeffs, X_future_scaled[:, pm2_idx])
-    
-    # 3. PyTorch Linear
-    class LinearModel(nn.Module):
-        def __init__(self, n): super().__init__(); self.linear = nn.Linear(n, 1)
-        def forward(self, x): return self.linear(x)
-    
-    m3 = LinearModel(len(selected_features))
-    m3.load_state_dict(torch.load("linear_model.pth"))
-    m3.eval()
-    pred["PyTorch_Linear"] = m3(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
-    
-    # 4. PyTorch MLP
-    class MLP(nn.Module):
-        def __init__(self, n):
-            super().__init__()
-            self.fc1 = nn.Linear(n, 64); self.fc2 = nn.Linear(64, 32); self.fc3 = nn.Linear(32, 1)
-            self.r = nn.ReLU()
-        def forward(self, x): return self.fc3(self.r(self.fc2(self.r(self.fc1(x)))))
-    
-    m4 = MLP(len(selected_features))
-    m4.load_state_dict(torch.load("mlp_model.pth"))
-    m4.eval()
-    pred["PyTorch_MLP"] = m4(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
-    
-    # 5. GB
-    gb = joblib.load("gb_model.pkl")
-    pred["GB"] = gb.predict(X_future)
-    
-    # 6. XGB
-    xg = xgb.XGBRegressor()
-    xg.load_model("xgb_model.json")
-    pred["XGB"] = xg.predict(X_future)
-    
-    # 7. RF
-    rf = joblib.load("rf_model.pkl")
-    pred["RF"] = rf.predict(X_future)
-    
-    # Ensemble
-    pred["Ensemble"] = pred[['Linear', 'Polynomial', 'PyTorch_Linear', 'PyTorch_MLP', 'GB', 'XGB', 'RF']].mean(axis=1)
-    
-    # Clip
-    for col in pred.columns[2:]:
-        pred[col] = np.clip(pred[col], 0, 500)
-    
-    # Closest Model
-    model_cols = pred.columns.drop(["datetime_utc", "Actual_AQI"])
-    pred["Closest_Model"] = (pred[model_cols].sub(pred["Actual_AQI"], axis=0).abs().idxmin(axis=1))
-    
-    # Summary Metrics
-    model_map = {
-        'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear',
-        'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost',
-        'RF': 'Random Forest', 'Ensemble': 'Ensemble'
-    }
-    model_cols = [col for col in pred.columns if col not in ['datetime_utc', 'Actual_AQI', 'Closest_Model']]
-    summary_data = []
-    y_true = pred['Actual_AQI']
-    for model_col in model_cols:
-        if model_col in model_map:
-            y_pred = pred[model_col]
-            mae, rmse, r2, mape = calc_metrics(y_true, y_pred)
-            summary_data.append({
-                'Model': model_map[model_col], 'MAE': mae, 'RMSE': rmse, 'R²': r2, 'MAPE': mape
-            })
-    comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
-    
-    # Save to data/
-    pred.to_csv("data/future_aqi_predictions.csv", index=False)
-    comparison_summary.to_csv("data/future_prediction_comparison.csv", index=False)
-    
-    print("💾 Saved: data/future_aqi_predictions.csv")
-    print("💾 Saved: data/future_prediction_comparison.csv")
-    
-    print("\n📊 Sample Output:")
-    print(pred.head(10))
-    print("\n📊 Forecast Performance Summary:")
-    print(comparison_summary)
+    try:
+        os.makedirs('data', exist_ok=True)
+        df_clean = df_feat  # Historical for cleaning
+        
+        # Fetch forecast pollutants
+        def fetch_forecast_pollutants(lat, lon, api_key):
+            url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
+            r = requests.get(url)
+            r.raise_for_status()  # Raise error for bad status codes
+            data = r.json()
+            records = []
+            for item in data["list"]:
+                dt = datetime.fromtimestamp(item["dt"], tz=UTC)
+                comp = item["components"]
+                aqi_1_5 = item["main"]["aqi"]
+                temp_row = {"datetime_utc": dt, **comp}
+                usaqi = calc_us_aqi(pd.Series(temp_row))
+                usaqi = np.clip(usaqi, 0, 500)
+                records.append({
+                    "datetime_utc": dt,
+                    "aqi_api": aqi_1_5,
+                    "Actual_AQI": usaqi,  # For comparison (forecast-based "actual")
+                    **comp
+                })
+            return pd.DataFrame(records)
+        
+        api_key = os.getenv("OWM_API_KEY")
+        if not api_key:
+            print("⚠️ OWM_API_KEY not set. Skipping forecast generation.")
+            return
+        
+        print("🌐 Fetching forecast data from OpenWeatherMap API...")
+        forecast_df = fetch_forecast_pollutants(LAT, LON, api_key)
+        print(f"✅ Forecast pollutant data received: {forecast_df.shape[0]} hours")
+        print(f"📊 Forecast columns: {list(forecast_df.columns)}")
+        
+        # Clean & Feature Engineering with is_forecast=True flag
+        print("🔧 Cleaning and engineering features...")
+        pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
+        for col in pollutants:
+            if col in forecast_df.columns and col in df_clean.columns:
+                forecast_df[col] = forecast_df[col].clip(lower=0)
+                forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
+                forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
+        
+        forecast_feat = engineer_features(forecast_df, is_forecast=True)
+        print(f"✅ Feature engineering complete. Shape: {forecast_feat.shape}")
+        print(f"📊 Engineered columns: {list(forecast_feat.columns)}")
+        
+        # Ensure all selected features exist, fill missing with 0
+        print(f"🔍 Checking for {len(selected_features)} selected features...")
+        missing_features = []
+        for feature in selected_features:
+            if feature not in forecast_feat.columns:
+                print(f"⚠️ Missing feature '{feature}' in forecast data, filling with 0")
+                forecast_feat[feature] = 0
+                missing_features.append(feature)
+        
+        if missing_features:
+            print(f"⚠️ Total missing features: {len(missing_features)}")
+        else:
+            print("✅ All selected features present in forecast data")
+        
+        print("🔄 Preparing feature matrix...")
+        X_future = forecast_feat[selected_features].fillna(0).values
+        print(f"✅ X_future shape: {X_future.shape}")
+        
+        print("📏 Loading scaler and transforming data...")
+        scaler = joblib.load('scaler.pkl')
+        X_future_scaled = scaler.transform(X_future)
+        print(f"✅ X_future_scaled shape: {X_future_scaled.shape}")
+        
+        # Predictions
+        print("🤖 Generating predictions from all models...")
+        pred = pd.DataFrame({
+            "datetime_utc": forecast_df["datetime_utc"],
+            "Actual_AQI": forecast_df["Actual_AQI"].astype(float)
+        })
+        
+        # 1. Linear Regression
+        print("  1️⃣ Linear Regression...")
+        model1 = pickle.load(open('linear_model.pkl', 'rb'))
+        X_sm = sm.add_constant(X_future_scaled)
+        pred["Linear"] = model1.predict(X_sm)
+        
+        # 2. Polynomial
+        print("  2️⃣ Polynomial Regression...")
+        coeffs = np.load('poly_coeffs.npy')
+        pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
+        pred["Polynomial"] = np.polyval(coeffs, X_future_scaled[:, pm2_idx])
+        
+        # 3. PyTorch Linear
+        print("  3️⃣ PyTorch Linear...")
+        class LinearModel(nn.Module):
+            def __init__(self, n): 
+                super().__init__()
+                self.linear = nn.Linear(n, 1)
+            def forward(self, x): 
+                return self.linear(x)
+        
+        m3 = LinearModel(len(selected_features))
+        m3.load_state_dict(torch.load("linear_model.pth", map_location='cpu'))
+        m3.eval()
+        with torch.no_grad():
+            pred["PyTorch_Linear"] = m3(torch.tensor(X_future_scaled, dtype=torch.float32)).numpy().flatten()
+        
+        # 4. PyTorch MLP
+        print("  4️⃣ PyTorch MLP...")
+        class MLP(nn.Module):
+            def __init__(self, n):
+                super().__init__()
+                self.fc1 = nn.Linear(n, 64)
+                self.fc2 = nn.Linear(64, 32)
+                self.fc3 = nn.Linear(32, 1)
+                self.r = nn.ReLU()
+            def forward(self, x): 
+                return self.fc3(self.r(self.fc2(self.r(self.fc1(x)))))
+        
+        m4 = MLP(len(selected_features))
+        m4.load_state_dict(torch.load("mlp_model.pth", map_location='cpu'))
+        m4.eval()
+        with torch.no_grad():
+            pred["PyTorch_MLP"] = m4(torch.tensor(X_future_scaled, dtype=torch.float32)).numpy().flatten()
+        
+        # 5. GB
+        print("  5️⃣ Gradient Boosting...")
+        gb = joblib.load("gb_model.pkl")
+        pred["GB"] = gb.predict(X_future)
+        
+        # 6. XGB
+        print("  6️⃣ XGBoost...")
+        xg = xgb.XGBRegressor()
+        xg.load_model("xgb_model.json")
+        pred["XGB"] = xg.predict(X_future)
+        
+        # 7. RF
+        print("  7️⃣ Random Forest...")
+        rf = joblib.load("rf_model.pkl")
+        pred["RF"] = rf.predict(X_future)
+        
+        # Ensemble
+        print("🎯 Computing ensemble predictions...")
+        pred["Ensemble"] = pred[['Linear', 'Polynomial', 'PyTorch_Linear', 'PyTorch_MLP', 'GB', 'XGB', 'RF']].mean(axis=1)
+        
+        # Clip
+        print("✂️ Clipping predictions to valid AQI range [0, 500]...")
+        for col in pred.columns[2:]:
+            pred[col] = np.clip(pred[col], 0, 500)
+        
+        # Closest Model
+        print("🎯 Finding closest model for each prediction...")
+        model_cols = pred.columns.drop(["datetime_utc", "Actual_AQI"])
+        pred["Closest_Model"] = (pred[model_cols].sub(pred["Actual_AQI"], axis=0).abs().idxmin(axis=1))
+        
+        # Summary Metrics
+        print("📊 Computing summary metrics...")
+        model_map = {
+            'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear',
+            'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost',
+            'RF': 'Random Forest', 'Ensemble': 'Ensemble'
+        }
+        model_cols = [col for col in pred.columns if col not in ['datetime_utc', 'Actual_AQI', 'Closest_Model']]
+        summary_data = []
+        y_true = pred['Actual_AQI']
+        for model_col in model_cols:
+            if model_col in model_map:
+                y_pred = pred[model_col]
+                mae, rmse, r2, mape = calc_metrics(y_true, y_pred)
+                summary_data.append({
+                    'Model': model_map[model_col], 'MAE': mae, 'RMSE': rmse, 'R²': r2, 'MAPE': mape
+                })
+        comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
+        
+        # Save to data/
+        print("💾 Saving results to CSV files...")
+        pred.to_csv("data/future_aqi_predictions.csv", index=False)
+        comparison_summary.to_csv("data/future_prediction_comparison.csv", index=False)
+        
+        print("✅ Saved: data/future_aqi_predictions.csv")
+        print("✅ Saved: data/future_prediction_comparison.csv")
+        
+        print("\n📊 Sample Output:")
+        print(pred.head(10).to_string())
+        print("\n📊 Forecast Performance Summary:")
+        print(comparison_summary.to_string(index=False))
+        print("\n✅ Future predictions generated successfully!")
+        
+    except Exception as e:
+        print(f"\n❌ ERROR in generate_future_predictions: {type(e).__name__}: {str(e)}")
+        import traceback
+        print("\n🔍 Full traceback:")
+        traceback.print_exc()
+        raise  # Re-raise to ensure the workflow fails properly
 
 # =============================================================================
 # MAIN EXECUTION
@@ -898,5 +949,3 @@ if __name__ == "__main__":
     print(" - data/future_aqi_predictions.csv")
     print(" - data/future_prediction_comparison.csv")
     print(" - Checkpoints in 'checkpoints/' for resuming/inspection")
-
-
