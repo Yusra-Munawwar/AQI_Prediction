@@ -210,8 +210,8 @@ if __name__ == "__main__":
     df_feat = fetch_from_hopsworks(for_training=True)
     df_feat = engineer_features(df_feat)
     local_csv_path = os.path.join(DATA_DIR, '2years_features.csv')
-        if not os.path.exists(local_csv_path):
-           raise FileNotFoundError(f"Local CSV not found at {local_csv_path}. Please upload it to the data/ folder.")
+    if not os.path.exists(local_csv_path):
+        raise FileNotFoundError(f"Local CSV not found at {local_csv_path}. Please upload it to the data/ folder.")
 
     local_df = pd.read_csv(local_csv_path)
     local_df = engineer_features(local_df)
