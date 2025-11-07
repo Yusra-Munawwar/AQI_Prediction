@@ -7,30 +7,31 @@ jobs:
   train:
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # Required to push changes
+      contents: write # Required to push changes
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
-          
+          fetch-depth: 0  # ← FULL CLONE: allows git pull
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_training.txt --extra-index-url https://download.pytorch.org/whl/cpu
-          
+
       - name: Run Training Pipeline
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
         run: python scripts/training.py
-        
+
       - name: Debug - List Generated Files
         run: |
           echo "=== Files in root ==="
@@ -41,49 +42,40 @@ jobs:
           ls -la checkpoints/ 2>/dev/null || echo "No checkpoints directory"
           echo "=== Files in best_models/ ==="
           ls -la best_models/ 2>/dev/null || echo "No best_models directory"
-          
+
       - name: Commit Updated Files
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          # Create timestamp
+
           TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
-          
-          # Stage files explicitly (more reliable than globs)
+
+          # Stage all expected files
           git add data/training_results.csv || echo "training_results.csv not found"
           git add data/future_aqi_predictions.csv || echo "future_aqi_predictions.csv not found"
           git add data/future_prediction_comparison.csv || echo "future_prediction_comparison.csv not found"
-          
-          # Stage model files
-          git add linear_model.pkl || true
-          git add poly_coeffs.npy || true
-          git add linear_model.pth || true
-          git add mlp_model.pth || true
-          git add gb_model.pkl || true
-          git add xgb_model.json || true
-          git add rf_model.pkl || true
-          git add scaler.pkl || true
-          git add selected_features.json || true
-          git add previous_best_results.csv || true
-          
-          # Stage directories if they exist
-          git add checkpoints/ || true
-          git add best_models/ || true
-          
-          # Show what's staged
+
+          git add linear_model.pkl poly_coeffs.npy linear_model.pth mlp_model.pth \
+                  gb_model.pkl xgb_model.json rf_model.pkl scaler.pkl selected_features.json \
+                  previous_best_results.csv || true
+
+          git add checkpoints/ best_models/ || true
+
           echo "=== Staged files ==="
           git status --short
-          
-          # Commit if there are changes
+
           if git diff --staged --quiet; then
-            echo "⚠️ No changes to commit."
+            echo "No changes to commit."
           else
             git commit -m "Update training results and forecasts [$TIMESTAMP]"
+
+            # PULL FIRST (with rebase) → THEN PUSH
+            git pull --rebase origin main || git pull --rebase origin main
             git push origin HEAD:main
-            echo "✅ Successfully committed and pushed changes"
+
+            echo "Successfully committed and pushed changes"
           fi
-          
+
       - name: Upload Models
         uses: actions/upload-artifact@v4
         with:
@@ -100,7 +92,7 @@ jobs:
             selected_features.json
             checkpoints/
             best_models/
-            
+
       - name: Upload Results Data
         uses: actions/upload-artifact@v4
         with:
