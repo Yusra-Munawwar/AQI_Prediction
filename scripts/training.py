@@ -693,7 +693,10 @@ def train_all_models(X_train, X_val, X_test, y_train, y_val, y_test,
     ]).sort_values('Test R²', ascending=False)
    
     print(results_summary.to_string(index=False, float_format='%.3f'))
-    
+    # === NEW: SAVE TO DISK ===
+    os.makedirs('data', exist_ok=True)
+    results_summary.to_csv('data/training_results.csv', index=False)
+    print("Saved: data/training_results.csv")
     # Compare and save best results for continuous training
     is_new_best = compare_and_save_best_results(results_summary)
     if not is_new_best:
