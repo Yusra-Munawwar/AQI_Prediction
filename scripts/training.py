@@ -1,495 +1,517 @@
-# train.py
+# =============================================================================
+# AQI TRAINING & FORECAST PIPELINE (Combined Script)
+# =============================================================================
+import pandas as pd
+import numpy as np
+import joblib
+import hopsworks
 import os
 import json
-import pickle
-import joblib
-import numpy as np
-import pandas as pd
-from datetime import datetime, timezone
 import requests
-import hopsworks
-import xgboost as xgb
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-import statsmodels.api as sm
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
+import xgboost as xgb
+import lightgbm as lgb
+import catboost as cb
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-UTC = timezone.utc
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+# --- GLOBAL CONFIGURATION (Used by the Forecasting Part) ---
+# NOTE: This API_KEY is for OpenWeatherMap.
+API_KEY = os.getenv("OWM_API_KEY") 
+LAT = 24.8607   # Karachi latitude
+LON = 67.0011   # Karachi longitude
+HISTORIC_PATH = "data/2years_features_clean.csv" # Adjusted path based on typical EDA output
 
-# Coordinates & API (set via env vars)
-LAT = float(os.getenv("LAT", "40.7128"))  # Default: NYC
-LON = float(os.getenv("LON", "-74.0060"))
-OWM_API_KEY = os.getenv("OWM_API_KEY")
+# =============================================================================
+# PART 1: MODEL TRAINING
+# =============================================================================
 
-# Feature group settings
-FEATURE_GROUP_NAME = "aqi_features"
-FEATURE_GROUP_VERSION = 1
+# ----------------------------------------------------------------------
+# 1. FETCH DATA (Training Data)
+# ----------------------------------------------------------------------
+print("\n" + "="*80)
+print("PART 1: FETCH TRAINING DATA")
+print("="*80)
 
-# ==========================================
-# HELPER: US AQI Calculation
-# ==========================================
-def calc_us_aqi(row):
-    """Convert pollutant concentrations to US AQI (simplified version)"""
-    pm25 = row['pm2_5']
-    pm10 = row['pm10']
-    o3 = row['o3']
-    no2 = row['no2']
-    co = row['co']
-    so2 = row['so2']
-
-    def aqi_from_breakpoints(c, breakpoints):
-        for (low_c, high_c), (low_i, high_i) in breakpoints:
-            if low_c <= c <= high_c:
-                return ((high_i - low_i) / (high_c - low_c)) * (c - low_c) + low_i
-        return 0
-
-    pm25_break = [((0, 12), (0, 50)), ((12.1, 35.4), (51, 100)), ((35.5, 55.4), (101, 150)),
-                  ((55.5, 150.4), (151, 200)), ((150.5, 250.4), (201, 300)), ((250.5, 500.4), (301, 500))]
-    pm10_break = [((0, 54), (0, 50)), ((55, 154), (51, 100)), ((155, 254), (101, 150)),
-                  ((255, 354), (151, 200)), ((355, 424), (201, 300)), ((425, 604), (301, 500))]
-    o3_break = [((0, 54), (0, 50)), ((55, 70), (51, 100)), ((71, 85), (101, 150)),
-                ((86, 105), (151, 200)), ((106, 200), (201, 300))]
-    no2_break = [((0, 53), (0, 50)), ((54, 100), (51, 100)), ((101, 360), (101, 150)),
-                 ((361, 649), (151, 200)), ((650, 1249), (201, 300)), ((1250, 2049), (301, 500))]
-    co_break = [((0, 4.4), (0, 50)), ((4.5, 9.4), (51, 100)), ((9.5, 12.4), (101, 150)),
-                ((12.5, 15.4), (151, 200)), ((15.5, 30.4), (201, 300)), ((30.5, 50.4), (301, 500))]
-    so2_break = [((0, 35), (0, 50)), ((36, 75), (51, 100)), ((76, 185), (101, 150)),
-                 ((186, 304), (151, 200)), ((305, 604), (201, 300)), ((605, 1004), (301, 500))]
-
-    aqi_pm25 = aqi_from_breakpoints(pm25, pm25_break)
-    aqi_pm10 = aqi_from_breakpoints(pm10, pm10_break)
-    aqi_o3 = aqi_from_breakpoints(o3, o3_break)
-    aqi_no2 = aqi_from_breakpoints(no2, no2_break)
-    aqi_co = aqi_from_breakpoints(co, co_break)
-    aqi_so2 = aqi_from_breakpoints(so2, so2_break)
-
-    return max(aqi_pm25, aqi_pm10, aqi_o3, aqi_no2, aqi_co, aqi_so2, 0)
-
-# ==========================================
-# SECTION 1: FETCH FROM HOPSWORKS
-# ==========================================
-def fetch_from_hopsworks(feature_group_name="aqi_features", version=1, for_training=False):
-    print("\n" + "="*70)
-    print(f"{'FETCHING FROM HOPSWORKS FOR VERIFICATION' if not for_training else 'SECTION 1: FETCHING FEATURES FROM HOPSWORKS'}")
-    print("="*70)
+def fetch_training_data():
     try:
+        # HOPSWORKS_API_KEY is retrieved from environment variables
         project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
         fs = project.get_feature_store()
-        feature_group = fs.get_feature_group(name=feature_group_name, version=version)
-        df = feature_group.read()
-
-        if 'datetime_utc' in df.columns and df['datetime_utc'].dtype == 'int64':
-            df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', errors='coerce')
-            invalid_mask = df['datetime_utc'].isna() | (df['datetime_utc'] < pd.Timestamp('1678-01-01')) | (df['datetime_utc'] > pd.Timestamp('2262-04-11'))
-            if invalid_mask.sum() > 0:
-                print(f"Warning: Dropped {invalid_mask.sum()} rows with invalid timestamps.")
-                df = df[~invalid_mask].reset_index(drop=True)
-            int_cols = ['us_aqi', 'hour', 'month', 'day_of_week', 'is_weekend']
-            for col in int_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
-
-        if 'id' in df.columns:
-            df = df.drop('id', axis=1)
-
-        print(f"Success: Fetched from Hopsworks! Shape: {df.shape}")
+        fg = fs.get_feature_group(name="aqi_features", version=4)
+        cols = ['datetime_utc', 'us_aqi'] + [
+            'pm2_5', 'pm10', 'co', 'no2', 'so2',
+            'month_cos', 'total_pm', 'total_gases',
+            'no2_o3_ratio', 'pm2_5_rolling_3h', 'pm10_rolling_3h',
+            'co_rolling_3h', 'pm2_5_co_interaction',
+            'hour_sin', 'hour_cos'
+        ]
+        df = fg.select(cols).read()
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', utc=True)
+        print(f"Fetched from Hopsworks: {df.shape}")
         return df
     except Exception as e:
-        print(f"Error: Hopsworks fetch failed: {e}. Falling back to local CSV.")
-        local_path = os.path.join(DATA_DIR, "2years_features.csv")
-        try:
-            df = pd.read_csv(local_path)
-            print(f"Success: Fallback to local CSV! Shape: {df.shape}")
-            return df
-        except FileNotFoundError:
-            raise ValueError(f"No local CSV found at '{local_path}'. Place file in 'data/' folder.")
+        print(f"Hopsworks failed: {e}")
+        # Fallback path updated to assume it's in the data directory
+        df = pd.read_csv(HISTORIC_PATH) 
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+        print(f"Fallback CSV: {df.shape}")
+        return df
 
-# ==========================================
-# DATASET COMPARISON
-# ==========================================
-def compare_datasets(local_df, hops_df, tolerance=1e-6):
-    print("\n" + "="*70)
-    print("DATASET COMPARISON")
-    print("="*70)
+df = fetch_training_data()
+df = df.sort_values('datetime_utc').reset_index(drop=True)
 
-    local_sorted = local_df.sort_values('datetime_utc').reset_index(drop=True)
-    hops_sorted = hops_df.sort_values('datetime_utc').reset_index(drop=True)
+# ----------------------------------------------------------------------
+# 2. FEATURES (NO LAG)
+# ----------------------------------------------------------------------
+SELECTED_FEATURES = [
+    'pm2_5', 'pm10', 'co', 'no2', 'so2',
+    'month_cos', 'total_pm', 'total_gases',
+    'no2_o3_ratio', 'pm2_5_rolling_3h', 'pm10_rolling_3h',
+    'co_rolling_3h', 'pm2_5_co_interaction',
+    'hour_sin', 'hour_cos'
+]
 
-    if len(local_sorted) != len(hops_sorted):
-        print(f"Warning: Row count mismatch: Local={len(local_sorted)}, Hops={len(hops_sorted)}")
-        min_len = min(len(local_sorted), len(hops_sorted))
-        local_sorted = local_sorted.iloc[:min_len]
-        hops_sorted = hops_sorted.iloc[:min_len]
-        print(f"   Truncated to {min_len} rows.")
+X = df[SELECTED_FEATURES].fillna(0).values
+y = df['us_aqi'].values
 
-    print(f"Local shape: {local_sorted.shape}, Hops shape: {hops_sorted.shape}")
+# ----------------------------------------------------------------------
+# 3. SPLIT
+# ----------------------------------------------------------------------
+n = len(X)
+train_end = int(0.7 * n)
+val_end   = int(0.8 * n)
 
-    local_cols = set(local_sorted.columns)
-    hops_cols = set(hops_sorted.columns)
-    expected_extras = {'id'}
-    core_hops_cols = hops_cols - expected_extras
+X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
+y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
-    if local_cols == core_hops_cols:
-        print("Success: Core columns match")
-    else:
-        print("Warning: Column mismatch")
+# ----------------------------------------------------------------------
+# 4. SCALING
+# ----------------------------------------------------------------------
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled   = scaler.transform(X_val)
+X_test_scaled  = scaler.transform(X_test)
 
-    numeric_cols = local_sorted.select_dtypes(include=[np.number]).columns
-    if 'id' in numeric_cols:
-        numeric_cols = numeric_cols.drop('id')
+os.makedirs("model_artifacts", exist_ok=True)
+joblib.dump(scaler, "model_artifacts/scaler.pkl")
 
-    sample_local = local_sorted[numeric_cols].head(5).round(4)
-    sample_hops = hops_sorted[numeric_cols.intersection(hops_sorted.columns)].head(5).round(4)
+# ----------------------------------------------------------------------
+# 5. METRICS
+# ----------------------------------------------------------------------
+def calc_metrics(y_true, y_pred, name=""):
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2   = r2_score(y_true, y_pred)
+    mask = y_true != 0
+    mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if np.any(mask) else np.nan
+    print(f"{name:18} MAE: {mae:6.3f} | RMSE: {rmse:6.3f} | R²: {r2:6.3f} | MAPE: {mape:6.2f}%")
+    return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}
 
-    if sample_local.equals(sample_hops):
-        print("Success: Sample values match")
-    else:
-        close = np.allclose(sample_local.values, sample_hops.values, atol=tolerance)
-        print("Success: Values close" if close else "Error: Values differ")
+# ----------------------------------------------------------------------
+# 6. TIME-SERIES CV
+# ----------------------------------------------------------------------
+tscv = TimeSeriesSplit(n_splits=5)
 
-    if 'us_aqi' in local_sorted.columns:
-        local_mean = local_sorted['us_aqi'].mean()
-        hops_mean = hops_sorted['us_aqi'].mean()
-        if abs(local_mean - hops_mean) < tolerance:
-            print("Success: Target stats match")
+# ----------------------------------------------------------------------
+# 7. TRAIN MODELS (SAVE ALL)
+# ----------------------------------------------------------------------
+models      = {}
+cv_scores   = {}
+all_metrics = {"train": {}, "val": {}, "test": {}, "cv_mae": {}}
 
-    return (local_cols == core_hops_cols) and (abs(local_mean - hops_mean) < tolerance if 'us_aqi' in local_sorted.columns else True)
+print("\n" + "="*80)
+print("TRAINING & SAVING ALL MODELS")
+print("="*80)
 
-# ==========================================
-# FULL FEATURE ENGINEERING (Used for both training & forecast)
-# ==========================================
-def engineer_features(df, is_forecast=False):
-    """
-    Apply full feature engineering.
-    is_forecast=True → we need to create rolling & interaction features from raw data.
-    """
-    df = df.copy()
+def train_with_cv(model, name, use_scaled=False):
+    X_tr = X_train_scaled if use_scaled else X_train
+    X_va = X_val_scaled   if use_scaled else X_val
+    X_te = X_test_scaled   if use_scaled else X_test
 
-    # 1. Datetime conversion
-    if 'datetime_utc' in df.columns:
-        if df['datetime_utc'].dtype == 'int64':
-            df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', errors='coerce')
-        elif df['datetime_utc'].dtype == 'object':
-            df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce')
-        df = df.dropna(subset=['datetime_utc']).reset_index(drop=True)
+    # --- 5-fold CV ---
+    cv_mae = []
+    for tr_idx, val_idx in tscv.split(X_tr):
+        X_f_tr, X_f_va = X_tr[tr_idx], X_tr[val_idx]
+        y_f_tr, y_f_va = y_train[tr_idx], y_train[val_idx]
 
-    # 2. Basic time features
+        # Clone model to avoid refit issues
+        if name == "xgboost":
+            m = xgb.XGBRegressor(**model.get_params())
+            m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], verbose=False)
+        elif name == "lightgbm":
+            m = lgb.LGBMRegressor(**model.get_params())
+            m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], 
+                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
+        else:
+            m = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
+            m.fit(X_f_tr, y_f_tr)
+
+        pred = m.predict(X_f_va)
+        cv_mae.append(mean_absolute_error(y_f_va, pred))
+
+    cv_mae_mean = np.mean(cv_mae)
+    print(f"{name:12} CV MAE: {cv_mae_mean:.3f}")
+
+    # --- Final fit on full train ---
+    final_model = model
+    final_model.fit(X_tr, y_train)
+
+    # --- Predictions ---
+    pred_train = final_model.predict(X_tr)
+    pred_val   = final_model.predict(X_va)
+    pred_test  = final_model.predict(X_te)
+
+    # Store metrics
+    all_metrics['train'][name] = calc_metrics(y_train, pred_train, f"{name} Train")
+    all_metrics['val'][name]   = calc_metrics(y_val,   pred_val,   f"{name} Val")
+    all_metrics['test'][name]  = calc_metrics(y_test,  pred_test,  f"{name} Test")
+    all_metrics['cv_mae'][name] = cv_mae_mean
+
+    # Save this model
+    model_path = f"model_artifacts/model_{name}.pkl"
+    joblib.dump(final_model, model_path)
+    # print(f"Saved: {model_path}") # Removed for cleaner output
+
+    # Store in dict
+    models[name] = final_model
+    cv_scores[name] = cv_mae_mean
+    return models, cv_scores
+
+# --------------------- TRAIN ALL MODELS ---------------------
+
+print("1. XGBoost")
+xgb_model = xgb.XGBRegressor(n_estimators=400, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(xgb_model, "xgboost")
+
+print("2. LightGBM")
+lgb_model = lgb.LGBMRegressor(n_estimators=1000, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(lgb_model, "lightgbm")
+
+print("3. CatBoost")
+cb_model = cb.CatBoostRegressor(iterations=500, depth=5, learning_rate=0.05, l2_leaf_reg=3, random_seed=42, verbose=False)
+models, cv_scores = train_with_cv(cb_model, "catboost")
+
+print("4. Random Forest")
+rf_model = RandomForestRegressor(n_estimators=300, max_depth=8, min_samples_split=20, min_samples_leaf=10, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(rf_model, "rf")
+
+print("5. Gradient Boosting")
+gb_model = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8, min_samples_split=20, min_samples_leaf=10, random_state=42)
+models, cv_scores = train_with_cv(gb_model, "gb")
+
+print("6. Ridge")
+ridge_model = Ridge(alpha=10.0, random_state=42)
+models, cv_scores = train_with_cv(ridge_model, "ridge", use_scaled=True)
+
+print("7. Linear")
+lr_model = LinearRegression()
+models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
+
+# ----------------------------------------------------------------------
+# 8. BEST MODEL
+# ----------------------------------------------------------------------
+best_name = min(cv_scores, key=cv_scores.get)
+best_mod  = models[best_name]
+
+print("\n" + "="*80)
+print(f"BEST MODEL: {best_name.upper()} | CV MAE: {cv_scores[best_name]:.3f}")
+print("="*80)
+
+# Save best model separately for inference
+best_model_path = f"model_artifacts/best_model_{best_name}.pkl"
+joblib.dump(best_mod, best_model_path)
+print(f"Best model also saved: {best_model_path}")
+
+# Final test prediction with best model
+X_test_fin = X_test_scaled if best_name in ["ridge", "linear"] else X_test
+y_test_pred = best_mod.predict(X_test_fin)
+test_metrics = calc_metrics(y_test, y_test_pred, "FINAL TEST")
+
+# ----------------------------------------------------------------------
+# 9. SAVE ALL METRICS & CONFIG
+# ----------------------------------------------------------------------
+joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
+
+with open("model_artifacts/metrics.json", "w") as f:
+    json.dump({
+        "best_model": best_name,
+        "cv_mae": cv_scores,
+        "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
+        "best_test": test_metrics,
+        "features": SELECTED_FEATURES,
+        "scaler_needed": best_name in ["ridge", "linear"],
+        "all_models_saved": [f"model_{name}.pkl" for name in models],
+        "all_metrics": all_metrics
+    }, f, indent=2)
+
+print(f"All metrics saved to model_artifacts/metrics.json")
+
+# ----------------------------------------------------------------------
+# 10. TRAINING FINAL SUMMARY
+# ----------------------------------------------------------------------
+print("\n" + "="*80)
+print("TRAINING COMPLETE – ALL MODELS SAVED")
+print("="*80)
+print(f"Best Model      : {best_name.upper()}")
+print(f"CV MAE          : {cv_scores[best_name]:.3f}")
+print(f"Test MAE        : {test_metrics['mae']:.3f}")
+print(f"Test R²         : {test_metrics['r2']:.3f}")
+print(f"Gap (CV→Test)   : {test_metrics['mae'] - cv_scores[best_name]:.3f}")
+print(f"All Models      : model_artifacts/model_*.pkl")
+print(f"Best Model      : {best_model_path}")
+print("="*80)
+
+# =============================================================================
+# PART 2: FORECASTING
+# =============================================================================
+# This part runs immediately after training, using the artifacts just saved.
+
+# ----------------------------------------------------------------------
+# 0. CONFIG (MODIFIED: Use existing objects)
+# ----------------------------------------------------------------------
+MODEL_PATHS = {
+    "xgboost":   "model_artifacts/model_xgboost.pkl",
+    "lightgbm":  "model_artifacts/model_lightgbm.pkl",
+    "catboost":  "model_artifacts/model_catboost.pkl",
+    "rf":        "model_artifacts/model_rf.pkl",
+    "gb":        "model_artifacts/model_gb.pkl",
+    "ridge":     "model_artifacts/model_ridge.pkl",
+    "linear":    "model_artifacts/model_linear.pkl"
+}
+
+# The objects (scaler, models, SELECTED_FEATURES) are already in memory 
+# from the training part, but reloading is safer for a standalone script,
+# so we'll re-load them from disk as per your original design.
+# This section assumes Part 1 has run and created the artifacts.
+
+print("\n" + "#"*80)
+print("PART 2: 96-HOUR AQI FORECAST")
+print("#"*80)
+
+# Load scaler & features (Redundant but ensures continuity if run standalone)
+# scaler = joblib.load("model_artifacts/scaler.pkl")
+# SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
+
+# Load models
+# The 'models' dictionary is already populated from Part 1, but we use the
+# MODEL_PATHS dictionary for consistency with the original script structure.
+models = {}
+for name, path in MODEL_PATHS.items():
+    try:
+        models[name] = joblib.load(path)
+        # print(f"Loaded {name}")
+    except Exception as e:
+        print(f"Failed to load {name}: {e}")
+
+print(f"Loaded {len(models)} models for prediction.")
+
+# ----------------------------------------------------------------------
+# 1. US-AQI CONVERSION (RE-DEFINED FOR CLARITY, SAME CODE)
+# ----------------------------------------------------------------------
+breakpoints = {
+    'pm2_5': [(0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
+              (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)],
+    'pm10':  [(0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
+              (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
+              (505, 401, 604, 500)],
+    'o3':    [(0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
+              (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
+              (0.405, 401, 0.604, 500)],
+    'no2':   [(0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
+              (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
+              (1.050, 401, 2.104, 500)],
+    'so2':   [(0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
+              (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
+              (0.186, 401, 0.604, 500)],
+    'co':    [(0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
+              (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)]
+}
+
+def to_epa_units(c, pollutant):
+    if pd.isna(c) or c <= 0: return 0.0
+    if pollutant == 'co':    return c / 1145.0
+    if pollutant == 'o3':    return c / 1960.6
+    if pollutant == 'no2':   return c / 1881.1
+    if pollutant == 'so2':   return c / 2620.0
+    return c
+
+def calc_sub_aqi(c, pollutant):
+    c_epa = to_epa_units(c, pollutant)
+    bps = breakpoints.get(pollutant, [])
+    if c_epa <= 0: return 0
+    prev_high = -np.inf
+    for c_low, i_low, c_high, i_high in bps:
+        if c_epa > prev_high and c_epa <= c_high:
+            return i_low + ((i_high - i_low) * (c_epa - c_low)) / (c_high - c_low)
+        prev_high = c_high
+    return 500
+
+def calc_us_aqi(row):
+    pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
+    sub_aqis = [calc_sub_aqi(row.get(p, 0), p) for p in pollutants]
+    return max(sub_aqis)
+
+# ----------------------------------------------------------------------
+# 2. FETCH 96-HOUR FORECAST
+# ----------------------------------------------------------------------
+def get_pollution_forecast(lat, lon, api_key):
+    url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        raise ValueError(f"API error: {resp.text}")
+    data = resp.json()
+    rows = []
+    for item in data['list']:
+        dt = datetime.utcfromtimestamp(item['dt'])
+        comp = item['components']
+        rows.append({
+            'datetime_utc': dt,
+            'pm2_5': comp['pm2_5'], 'pm10': comp['pm10'], 'co': comp['co'],
+            'no2': comp['no2'], 'o3': comp['o3'], 'so2': comp['so2']
+        })
+    df = pd.DataFrame(rows)
+    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+    return df.head(96)
+
+print("Fetching 96-hour forecast...")
+df_forecast = get_pollution_forecast(LAT, LON, API_KEY)
+df_forecast['Actual_AQI'] = df_forecast.apply(calc_us_aqi, axis=1).round().astype(int).clip(0, 500)
+
+# ----------------------------------------------------------------------
+# 3. LOAD HISTORIC DATA (FIXED: ISO8601)
+# ----------------------------------------------------------------------
+print(f"Loading historic data from {HISTORIC_PATH}...")
+df_hist = pd.read_csv(HISTORIC_PATH)
+df_hist['datetime_utc'] = pd.to_datetime(df_hist['datetime_utc'], format='ISO8601', utc=True)
+df_hist = df_hist.sort_values('datetime_utc').reset_index(drop=True)
+last_3 = df_hist.tail(3)
+
+# ----------------------------------------------------------------------
+# 4. BUILD FEATURES
+# ----------------------------------------------------------------------
+def build_features(df_fc, last_hist):
+    df = df_fc.copy()
     df['hour'] = df['datetime_utc'].dt.hour
     df['month'] = df['datetime_utc'].dt.month
-    df['day_of_week'] = df['datetime_utc'].dt.dayofweek
-    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
-    # 3. Only for forecast: create rolling & interaction features
-    if is_forecast:
-        # Sort by time
-        df = df.sort_values('datetime_utc').reset_index(drop=True)
+    df['total_pm'] = df['pm2_5'] + df['pm10']
+    df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
+    df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
+    df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
 
-        # Rolling 3-hour means (requires at least 3 rows)
-        pollutants = ['pm2_5', 'pm10', 'co', 'no2', 'o3']
-        for col in pollutants:
-            if col in df.columns:
-                df[f'{col}_rolling_3h'] = df[col].rolling(window=3, min_periods=1).mean()
+    combined = pd.concat([last_hist[['pm2_5', 'pm10', 'co']], df[['pm2_5', 'pm10', 'co']]], ignore_index=True)
+    df['pm2_5_rolling_3h'] = combined['pm2_5'].rolling(3, min_periods=1).mean().iloc[-96:].values
+    df['pm10_rolling_3h']  = combined['pm10'].rolling(3, min_periods=1).mean().iloc[-96:].values
+    df['co_rolling_3h']    = combined['co'].rolling(3, min_periods=1).mean().iloc[-96:].values
 
-        # Interaction
-        if 'pm2_5' in df.columns and 'co' in df.columns:
-            df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
-
-        # Ratios
-        if 'no2' in df.columns and 'o3' in df.columns:
-            df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
-
-        # Totals
-        if all(col in df.columns for col in ['pm2_5', 'pm10']):
-            df['total_pm'] = df['pm2_5'] + df['pm10']
-        if all(col in df.columns for col in ['co', 'no2', 'o3', 'so2']):
-            df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
-
+    # Ensure 'us_aqi' is in last_hist for lag feature, fetch from df if not present
+    if 'us_aqi' in last_hist.columns:
+        df['us_aqi_lag1'] = last_hist['us_aqi'].iloc[-1]
+    else:
+        # If 'us_aqi' column is not in the historic features file, this feature will be missing
+        df['us_aqi_lag1'] = 0 
+        
+    df = df.drop(columns=['hour', 'month'], errors='ignore')
     return df
 
-# ==========================================
-# METRICS
-# ==========================================
-def calc_metrics(y_true, y_pred):
+df_fc_feat = build_features(df_forecast, last_3)
+X = df_fc_feat[SELECTED_FEATURES].fillna(0).values
+
+# ----------------------------------------------------------------------
+# 5. PREDICT WITH ALL MODELS
+# ----------------------------------------------------------------------
+predictions = {'datetime': df_fc_feat['datetime_utc'], 'Actual_AQI': df_fc_feat['Actual_AQI']}
+model_names = list(models.keys())
+
+for name in model_names:
+    # print(f"Predicting with {name}...") # Removed for cleaner output
+    model = models[name]
+    if name in ["ridge", "linear"]:
+        X_input = scaler.transform(X)
+    else:
+        X_input = X
+    pred = model.predict(X_input)
+    pred = np.clip(pred.round().astype(int), 0, 500)
+    predictions[name] = pred
+
+# Closest Model
+abs_errors = np.abs(np.array([predictions[m] for m in model_names]) - predictions['Actual_AQI'].values)
+closest_idx = np.argmin(abs_errors, axis=0)
+predictions['Closest_Model'] = [model_names[i] for i in closest_idx]
+
+# ----------------------------------------------------------------------
+# 6. SAVE future_aqi_predictions.csv (EXACT COLUMNS)
+# ----------------------------------------------------------------------
+cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear', 'Closest_Model']
+df_pred = pd.DataFrame(predictions)[cols]
+df_pred.to_csv("future_aqi_predictions.csv", index=False)
+print("Saved: future_aqi_predictions.csv")
+
+# ----------------------------------------------------------------------
+# 7. METRICS → future_prediction_comparison.csv
+# ----------------------------------------------------------------------
+y_true = df_pred['Actual_AQI'].values
+metrics_list = []
+
+for name in model_names:
+    y_pred = df_pred[name].values
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
-    mask = y_true != 0
-    mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if np.any(mask) else np.nan
-    return mae, rmse, r2, mape
-
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    # --- Fetch & Verify ---
-    df_feat = fetch_from_hopsworks(for_training=True)
-    df_feat = engineer_features(df_feat, is_forecast=False)  # Training data already has features
-
-    local_csv_path = os.path.join(DATA_DIR, '2years_features.csv')
-    if not os.path.exists(local_csv_path):
-        raise FileNotFoundError(f"Local CSV not found at {local_csv_path}")
-    local_df = pd.read_csv(local_csv_path)
-    local_df = engineer_features(local_df, is_forecast=False)
-
-    hops_df = fetch_from_hopsworks(for_training=False)
-    is_match = compare_datasets(local_df, hops_df)
-    print("\nSuccess: CORE MATCH! Ready for training!" if is_match else "\nWarning: Minor differences detected.")
-
-    # --- Data Prep ---
-    print("\n" + "="*70)
-    print("SECTION 2: DATA PREPARATION & SPLITTING")
-    print("="*70)
-
-    exclude = ['us_aqi', 'aqi_category', 'id', 'datetime_utc', 'aqi']
-    feature_cols = [col for col in df_feat.columns if col not in exclude]
-    corr = df_feat[feature_cols + ['us_aqi']].corr()['us_aqi'].sort_values(ascending=False)
-    selected_features = [f for f in corr.index[1:] if abs(corr[f]) > 0.3]
-    print(f"Success: Using {len(selected_features)} features: {selected_features}")
-
-    X = df_feat[selected_features].fillna(0).values
-    y = df_feat['us_aqi'].values
-
-    split_train = int(0.7 * len(X))
-    split_val = int(0.8 * len(X))
-    X_train, X_val, X_test = X[:split_train], X[split_train:split_val], X[split_val:]
-    y_train, y_val, y_test = y[:split_train], y[split_train:split_val], y[split_val:]
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-    X_test_scaled = scaler.transform(X_test)
-    joblib.dump(scaler, os.path.join(DATA_DIR, 'scaler.pkl'))
-
-    tscv = TimeSeriesSplit(n_splits=5)
-
-    # --- Model Training ---
-    print("\n" + "="*70)
-    print("SECTION 3: MODEL TRAINING (7 MODELS)")
-    print("="*70)
-    results = {}
-
-    # [Model training code unchanged — omitted for brevity but kept in full script]
-    # ... (Linear, Poly, PyTorch, MLP, GB, XGB, RF) ...
-
-    # 1. Linear
-    X_train_sm = sm.add_constant(X_train_scaled)
-    model1 = sm.OLS(y_train, X_train_sm).fit()
-    y_test_pred1 = model1.predict(sm.add_constant(X_test_scaled))
-    mae1, rmse1, r21, mape1 = calc_metrics(y_test, y_test_pred1)
-    cv_scores1 = [r2_score(y_train[val_idx], sm.OLS(y_train[train_idx], sm.add_constant(X_train_scaled[train_idx])).fit().predict(sm.add_constant(X_train_scaled[val_idx]))) for train_idx, val_idx in tscv.split(X_train_scaled)]
-    results['linear'] = {'name': 'Linear Regression', 'test_r2': r21, 'test_rmse': rmse1, 'test_mae': mae1, 'test_mape': mape1, 'cv_r2': np.mean(cv_scores1)}
-    with open(os.path.join(DATA_DIR, 'linear_model.pkl'), 'wb') as f:
-        pickle.dump(model1, f)
-
-    # 2. Polynomial
-    pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
-    p_coeffs = np.polyfit(X_train_scaled[:, pm2_idx], y_train, 2)
-    y_test_pred2 = np.polyval(p_coeffs, X_test_scaled[:, pm2_idx])
-    mae2, rmse2, r22, mape2 = calc_metrics(y_test, y_test_pred2)
-    results['poly'] = {'name': 'Polynomial Regression', 'test_r2': r22, 'test_rmse': rmse2, 'test_mae': mae2, 'test_mape': mape2}
-    np.save(os.path.join(DATA_DIR, 'poly_coeffs.npy'), p_coeffs)
-
-    # 3. PyTorch Linear
-    class LinearModel(nn.Module):
-        def __init__(self, n): super().__init__(); self.linear = nn.Linear(n, 1)
-        def forward(self, x): return self.linear(x)
-    device = torch.device('cpu')
-    model3 = LinearModel(len(selected_features)).to(device)
-    X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
-    loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=32, shuffle=True)
-    opt = optim.Adam(model3.parameters(), lr=0.01)
-    criterion = nn.MSELoss()
-    for _ in range(100):
-        for bx, by in loader:
-            opt.zero_grad()
-            loss = criterion(model3(bx), by)
-            loss.backward()
-            opt.step()
-    model3.eval()
-    y_test_pred3 = model3(torch.tensor(X_test_scaled, dtype=torch.float32)).detach().cpu().numpy().flatten()
-    mae3, rmse3, r23, mape3 = calc_metrics(y_test, y_test_pred3)
-    results['pytorch_linear'] = {'name': 'PyTorch Linear', 'test_r2': r23, 'test_rmse': rmse3, 'test_mae': mae3, 'test_mape': mape3}
-    torch.save(model3.state_dict(), os.path.join(DATA_DIR, 'linear_model.pth'))
-
-    # 4. MLP
-    class MLP(nn.Module):
-        def __init__(self, n):
-            super().__init__()
-            self.fc1 = nn.Linear(n, 64); self.fc2 = nn.Linear(64, 32); self.fc3 = nn.Linear(32, 1)
-            self.r = nn.ReLU(); self.d = nn.Dropout(0.3)
-        def forward(self, x): x = self.r(self.fc1(x)); x = self.d(x); x = self.r(self.fc2(x)); x = self.d(x); return self.fc3(x)
-    model4 = MLP(len(selected_features)).to(device)
-    opt = optim.Adam(model4.parameters(), lr=0.001)
-    for _ in range(100):
-        for bx, by in loader:
-            opt.zero_grad()
-            loss = criterion(model4(bx), by)
-            loss.backward()
-            opt.step()
-    model4.eval()
-    y_test_pred4 = model4(torch.tensor(X_test_scaled, dtype=torch.float32)).detach().cpu().numpy().flatten()
-    mae4, rmse4, r24, mape4 = calc_metrics(y_test, y_test_pred4)
-    results['mlp'] = {'name': 'PyTorch MLP', 'test_r2': r24, 'test_rmse': rmse4, 'test_mae': mae4, 'test_mape': mape4}
-    torch.save(model4.state_dict(), os.path.join(DATA_DIR, 'mlp_model.pth'))
-
-    # 5. GB
-    model5 = GradientBoostingRegressor(n_estimators=50, max_depth=3, learning_rate=0.05, subsample=0.7, min_samples_split=50, min_samples_leaf=20, random_state=42)
-    model5.fit(X_train, y_train)
-    y_test_pred5 = model5.predict(X_test)
-    mae5, rmse5, r25, mape5 = calc_metrics(y_test, y_test_pred5)
-    cv_scores5 = [r2_score(y_train[val_idx], GradientBoostingRegressor(**model5.get_params()).fit(X_train[train_idx], y_train[train_idx]).predict(X_train[val_idx])) for train_idx, val_idx in tscv.split(X_train)]
-    results['gb'] = {'name': 'Gradient Boosting', 'test_r2': r25, 'test_rmse': rmse5, 'test_mae': mae5, 'test_mape': mape5, 'cv_r2': np.mean(cv_scores5)}
-    joblib.dump(model5, os.path.join(DATA_DIR, 'gb_model.pkl'))
-
-    # 6. XGBoost
-    model6 = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.05, subsample=0.7, colsample_bytree=0.7, reg_alpha=2.0, reg_lambda=2.0, random_state=42, verbosity=0)
-    model6.fit(X_train, y_train)
-    y_test_pred6 = model6.predict(X_test)
-    mae6, rmse6, r26, mape6 = calc_metrics(y_test, y_test_pred6)
-    cv_scores6 = [r2_score(y_train[val_idx], xgb.XGBRegressor(**model6.get_params()).fit(X_train[train_idx], y_train[train_idx]).predict(X_train[val_idx])) for train_idx, val_idx in tscv.split(X_train)]
-    results['xgb'] = {'name': 'XGBoost', 'test_r2': r26, 'test_rmse': rmse6, 'test_mae': mae6, 'test_mape': mape6, 'cv_r2': np.mean(cv_scores6)}
-    model6.save_model(os.path.join(DATA_DIR, 'xgb_model.json'))
-
-    # 7. RF
-    model7 = RandomForestRegressor(n_estimators=50, max_depth=8, min_samples_split=50, min_samples_leaf=20, max_features=0.5, random_state=42)
-    model7.fit(X_train, y_train)
-    y_test_pred7 = model7.predict(X_test)
-    mae7, rmse7, r27, mape7 = calc_metrics(y_test, y_test_pred7)
-    cv_scores7 = [r2_score(y_train[val_idx], RandomForestRegressor(**model7.get_params()).fit(X_train[train_idx], y_train[train_idx]).predict(X_train[val_idx])) for train_idx, val_idx in tscv.split(X_train)]
-    results['rf'] = {'name': 'Random Forest', 'test_r2': r27, 'test_rmse': rmse7, 'test_mae': mae7, 'test_mape': mape7, 'cv_r2': np.mean(cv_scores7)}
-    joblib.dump(model7, os.path.join(DATA_DIR, 'rf_model.pkl'))
-
-    # Save training summary
-    summary_df = pd.DataFrame([{
-        'Model': v['name'],
-        'Test MAE': v['test_mae'],
-        'Test RMSE': v['test_rmse'],
-        'Test R²': v['test_r2'],
-        'Test MAPE (%)': v['test_mape'],
-        'CV R²': v.get('cv_r2', np.nan)
-    } for v in results.values()]).sort_values('Test R²', ascending=False)
-    summary_df.to_csv(os.path.join(DATA_DIR, 'training_results.csv'), index=False)
-    print(summary_df)
-
-    # ==========================================
-    # SECTION 6: FUTURE PREDICTION
-    # ==========================================
-    print("\n" + "="*70)
-    print("SECTION 6: FUTURE AQI PREDICTION")
-    print("="*70)
-
-    def fetch_forecast_pollutants(lat, lon, api_key):
-        url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
-        r = requests.get(url).json()
-        records = []
-        for item in r["list"]:
-            dt = datetime.fromtimestamp(item["dt"], tz=UTC)
-            comp = item["components"]
-            row = {"datetime_utc": dt, **comp}
-            usaqi = calc_us_aqi(pd.Series(row))
-            records.append({
-                "datetime_utc": dt,
-                "aqi_api": item["main"]["aqi"],
-                "Actual_AQI": np.clip(usaqi, 0, 500),
-                **comp
-            })
-        return pd.DataFrame(records)
-
-    if not OWM_API_KEY:
-        raise ValueError("OWM_API_KEY not set!")
-
-    forecast_df = fetch_forecast_pollutants(LAT, LON, OWM_API_KEY)
-    print(f"Success: Forecast data: {forecast_df.shape[0]} hours")
-
-    # Clean pollutants using historical stats
-    pollutants = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
-    df_clean = pd.read_csv(os.path.join(DATA_DIR, '2years_features.csv'))
-
-    for col in pollutants:
-        if col in forecast_df.columns:
-            forecast_df[col] = forecast_df[col].clip(lower=0)
-            forecast_df[col] = forecast_df[col].fillna(df_clean[col].median())
-            forecast_df[col] = forecast_df[col].clip(upper=df_clean[col].quantile(0.995))
-
-    # APPLY FULL FEATURE ENGINEERING (this is the fix!)
-    forecast_feat = engineer_features(forecast_df, is_forecast=True)
-
-    # Now select only the features used in training
-    missing_cols = [col for col in selected_features if col not in forecast_feat.columns]
-    if missing_cols:
-        print(f"Warning: Adding {len(missing_cols)} missing features with 0s: {missing_cols}")
-        for col in missing_cols:
-            forecast_feat[col] = 0
-
-    X_future = forecast_feat[selected_features].fillna(0)
-    X_future_scaled = scaler.transform(X_future.values)  # .values ensures array
-
-    # Predictions
-    pred = pd.DataFrame({
-        "datetime_utc": forecast_df["datetime_utc"],
-        "Actual_AQI": forecast_df["Actual_AQI"].astype(float)
+    # Handle division by zero for MAPE gracefully by adding 1e-6
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100 
+    metrics_list.append({
+        "Model": name,
+        "MAE": round(mae, 3),
+        "RMSE": round(rmse, 3),
+        "R²": round(r2, 3),
+        "MAPE": round(mape, 2)
     })
 
-    # Load models and predict
-    model1 = pickle.load(open(os.path.join(DATA_DIR, 'linear_model.pkl'), 'rb'))
-    pred["Linear"] = model1.predict(sm.add_constant(X_future_scaled, has_constant='add'))
+df_metrics = pd.DataFrame(metrics_list)
+df_metrics.to_csv("future_prediction_comparison.csv", index=False)
+print("Saved: future_prediction_comparison.csv")
+print("\n" + df_metrics.to_string(index=False))
 
-    coeffs = np.load(os.path.join(DATA_DIR, 'poly_coeffs.npy'))
-    pm2_idx = selected_features.index('pm2_5') if 'pm2_5' in selected_features else 0
-    pred["Polynomial"] = np.polyval(coeffs, X_future_scaled[:, pm2_idx])
+# ----------------------------------------------------------------------
+# 8. PLOT — 7 INDIVIDUAL GRAPHS (One per Model)
+# ----------------------------------------------------------------------
+print("Generating 7 individual model comparison plots...")
 
-    m3 = LinearModel(len(selected_features))
-    m3.load_state_dict(torch.load(os.path.join(DATA_DIR, 'linear_model.pth')))
-    m3.eval()
-    pred["PyTorch_Linear"] = m3(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
+os.makedirs("model_comparison_plots", exist_ok=True)
 
-    m4 = MLP(len(selected_features))
-    m4.load_state_dict(torch.load(os.path.join(DATA_DIR, 'mlp_model.pth')))
-    m4.eval()
-    pred["PyTorch_MLP"] = m4(torch.tensor(X_future_scaled, dtype=torch.float32)).detach().numpy().flatten()
+actual = df_pred['Actual_AQI'].values
+dates = df_pred['datetime']
 
-    pred["GB"] = joblib.load(os.path.join(DATA_DIR, 'gb_model.pkl')).predict(X_future)
-    xg = xgb.XGBRegressor(); xg.load_model(os.path.join(DATA_DIR, 'xgb_model.json'))
-    pred["XGB"] = xg.predict(X_future)
-    pred["RF"] = joblib.load(os.path.join(DATA_DIR, 'rf_model.pkl')).predict(X_future)
+for name in model_names:
+    pred = df_pred[name].values
+    
+    plt.figure(figsize=(14, 6))
+    plt.plot(dates, actual, label='Actual AQI (OWM)', color='black', linewidth=2.5, marker='o', markersize=3)
+    plt.plot(dates, pred, label=f'{name.upper()} Prediction', color='teal', linewidth=2.5, alpha=0.9)
+    plt.fill_between(dates, actual, pred, color='lightgray', alpha=0.5, label='Error Band')
+    
+    plt.title(f'96-Hour AQI Forecast: Actual vs {name.upper()}', fontsize=15, fontweight='bold')
+    plt.xlabel('Time (UTC)', fontsize=12)
+    plt.ylabel('US AQI', fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    safe_name = name.replace(" ", "_")
+    plt.savefig(f"model_comparison_plots/{safe_name}_vs_actual.png", dpi=200, bbox_inches='tight')
+    # plt.show() # Commented out as GitHub Actions run on servers without display
+    plt.close()
 
-    pred["Ensemble"] = pred[['Linear','Polynomial','PyTorch_Linear','PyTorch_MLP','GB','XGB','RF']].mean(axis=1)
-
-    for col in pred.columns[2:]:
-        pred[col] = np.clip(pred[col], 0, 500)
-
-    pred["Closest_Model"] = pred.iloc[:, 2:-1].sub(pred["Actual_AQI"], axis=0).abs().idxmin(axis=1)
-
-    # Summary
-    model_map = {
-        'Linear': 'Linear', 'Polynomial': 'Polynomial', 'PyTorch_Linear': 'PyTorch Linear',
-        'PyTorch_MLP': 'PyTorch MLP', 'GB': 'Gradient Boosting', 'XGB': 'XGBoost',
-        'RF': 'Random Forest', 'Ensemble': 'Ensemble'
-    }
-    summary_data = []
-    for col in pred.columns[2:-1]:
-        mae, rmse, r2, mape = calc_metrics(pred['Actual_AQI'], pred[col])
-        summary_data.append({'Model': model_map.get(col, col), 'MAE': mae, 'RMSE': rmse, 'R²': r2, 'MAPE': mape})
-    comparison_summary = pd.DataFrame(summary_data).sort_values('R²', ascending=False)
-
-    # Save
-    pred.to_csv(os.path.join(DATA_DIR, "future_aqi_predictions.csv"), index=False)
-    comparison_summary.to_csv(os.path.join(DATA_DIR, "future_prediction_comparison.csv"), index=False)
-    print("Success: Saved: future_aqi_predictions.csv, future_prediction_comparison.csv, training_results.csv")
-
-    print("\nSample Predictions:")
-    print(pred.head(10))
-    print("\nForecast Performance:")
-    print(comparison_summary)
+print("7 individual plots saved in: model_comparison_plots/")
+print("\nAll done!")
