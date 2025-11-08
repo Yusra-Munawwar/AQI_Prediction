@@ -271,12 +271,14 @@ def run_eda(df_feat):
     return df_feat # Return the DF with categories for Hopsworks upload
 
 # --- 4. Hopsworks Integration Helpers ---
+# --- 4. Hopsworks Integration Helpers ---
 
 if HOPSWORKS_AVAILABLE:
     
     def validate_dataframe_for_hopsworks(df):
         """
         Validate and prepare DataFrame for Hopsworks upload.
+        CRITICAL FIX: Ensures datetime_utc is an INT64 timestamp as the last step.
         """
         print("\n" + "="*70)
         print("VALIDATING DATAFRAME FOR HOPSWORKS")
@@ -287,76 +289,64 @@ if HOPSWORKS_AVAILABLE:
         # 1. Reset Index
         df_clean = df_clean.reset_index(drop=True)
         
-        # 2. Handle datetime (convert to Unix timestamp ms)
-        if 'datetime_utc' in df_clean.columns:
-            # Ensure it's a datetime object before converting to timestamp
-            df_clean['datetime_utc'] = pd.to_datetime(df_clean['datetime_utc'], errors='coerce')
-            df_clean['datetime_utc'] = df_clean['datetime_utc'].astype('int64') // 10**6
-            issues_fixed.append("Converted datetime_utc to timestamp (ms)")
-
-        # 3. Categorical to string
+        # 2. Categorical to string (for 'aqi_category')
         categorical_cols = df_clean.select_dtypes(include=['category']).columns
         for col in categorical_cols:
             df_clean[col] = df_clean[col].astype(str)
             issues_fixed.append(f"Converted '{col}' category to string")
 
-        # 4. Object columns to string and fill
-        object_cols = df_clean.select_dtypes(include=['object']).columns
-        for col in object_cols:
-             # Ensure aqi_category is handled correctly if it's an 'object' type string
-            df_clean[col] = df_clean[col].fillna('unknown').astype(str)
-            
-        # 5. Fill NaNs (before final numeric conversion)
-        nan_count = df_clean.isnull().sum().sum()
-        if nan_count > 0:
-            for col in df_clean.columns:
-                if df_clean[col].dtype in ['float64', 'int64', 'int32', 'float32', 'Int64']:
-                    df_clean[col] = df_clean[col].fillna(0)
-                else:
-                    df_clean[col] = df_clean[col].fillna('unknown')
-            issues_fixed.append("Filled NaN values (0 for numeric, 'unknown' for others)")
-
-        # 6. Numeric to float64/int64 and handle inf
-        # In eda.py -> validate_dataframe_for_hopsworks
-
-        # 6. Numeric to float64/int64 and handle inf
+        # 3. Handle numeric columns (pollutants, features, etc.)
         numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-    
-            # 🎯 FIX: EXCLUDE datetime_utc from float64 conversion
-            if col == 'datetime_utc':
-                # Ensure it remains a standard 64-bit integer (bigint)
-                df_clean[col] = df_clean[col].astype('int64')
-                continue # Skip the rest of the generic numeric checks for this column
         
+        # Prepare all non-timestamp numerics to float64, handling Inf/NaN
+        cols_to_float = [col for col in numeric_cols if col != 'datetime_utc']
+        
+        for col in cols_to_float:
+            # Handle Inf values by replacing them with NaN
             inf_count = np.isinf(df_clean[col]).sum()
-            # ... (rest of the infinity handling remains the same)
-    
+            if inf_count > 0:
+                df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan)
+                issues_fixed.append(f"Replaced infinity in '{col}'")
+                
             # Coerce to float64 (safe for all other numerics)
             df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').astype('float64')
 
-# ... (rest of the function)
-        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            inf_count = np.isinf(df_clean[col]).sum()
-            if inf_count > 0:
-                df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-                issues_fixed.append(f"Replaced infinity in '{col}'")
-                
-            # Coerce to float64 (safe for all numerics)
-            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').astype('float64')
+        # 4. Fill remaining NaN values
+        nan_count_before = df_clean.isnull().sum().sum()
+        if nan_count_before > 0:
+            for col in df_clean.columns:
+                if df_clean[col].dtype == np.object_ or df_clean[col].dtype == np.str_:
+                    df_clean[col] = df_clean[col].fillna('unknown')
+                elif col == 'datetime_utc': # Handle NaT/NaN if it survived up to here
+                    df_clean[col] = df_clean[col].fillna(0).astype('int64') 
+                else: # For float64/int64 columns
+                    df_clean[col] = df_clean[col].fillna(0)
+            issues_fixed.append("Filled NaN values (0 for numeric, 'unknown' for others)")
+            
+        # 5. FINAL CRITICAL STEP: Ensure datetime_utc is INT64 (BIGINT)
+        if 'datetime_utc' in df_clean.columns:
+            # Convert datetime back to UNIX timestamp in milliseconds (int64)
+            # This is the original logic, but now it's guaranteed to be the final type set.
+            # We must convert to datetime object first, then to timestamp.
+            df_clean['datetime_utc'] = pd.to_datetime(df_clean['datetime_utc'], errors='coerce')
+            df_clean['datetime_utc'] = (
+                df_clean['datetime_utc']
+                .astype(np.int64) // 10**6
+            ).astype('int64') 
+            # Re-adding this issue fix detail because this is where the final conversion happens
+            if "Converted datetime_utc to timestamp (ms)" not in issues_fixed:
+                issues_fixed.append("Converted datetime_utc to timestamp (ms)")
 
-        # 7. Sanitize column names
-        invalid_cols = [col for col in df_clean.columns if not col.replace('_', '').isalnum()]
-        if invalid_cols:
-             # Simple sanitization for clarity
-             df_clean.columns = [col.replace(' ', '_').replace('-', '_') for col in df_clean.columns]
+        # 6. Sanitize column names
+        # Your original sanitization logic is acceptable and does not affect the datetime column
+        df_clean.columns = [col.replace(' ', '_').replace('-', '_') for col in df_clean.columns]
+        if any(' ' in col or '-' in col for col in df.columns):
              issues_fixed.append("Sanitized column names")
+
 
         print(f"\n✅ VALIDATION COMPLETE. Issues fixed: {len(issues_fixed)}. Details: {issues_fixed}")
         print(f"Shape: {df_clean.shape}")
         return df_clean
-
     def upload_to_hopsworks(df, feature_group_name=HOPSWORKS_FG_NAME, version=HOPSWORKS_FG_VERSION):
         """
         Upload to Hopsworks Feature Store.
