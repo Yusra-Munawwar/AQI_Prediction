@@ -31,7 +31,7 @@ jobs:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
         # Assuming your script is named train.py in the root. Adjust the path if needed (e.g., scripts/train.py)
-        run: python train.py 
+        run: python scripts/training.py 
 
       - name: Debug - List Generated Files
         run: |
