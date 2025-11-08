@@ -1,1 +1,1 @@
-pm2_5,pm10,co,no2,so2,month_cos,total_pm,total_gases,no2_o3_ratio,pm2_5_rolling_3h,pm10_rolling_3h,co_rolling_3h,pm2_5_co_interaction
+pm2_5,pm10,co,no2,so2,nh3,us_aqi_lag1,us_aqi_lag24,month_cos,total_pm,total_gases,no2_o3_ratio,pm2_5_rolling_3h,pm10_rolling_3h,co_rolling_3h,pm2_5_co_interaction,hour_sin,hour_cos
