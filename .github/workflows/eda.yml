@@ -1,4 +1,3 @@
-# .github/workflows/eda.yml
 name: 2. EDA and Upload to Hopsworks
 permissions:
   contents: write
@@ -25,30 +24,46 @@ jobs:
         
     - name: Install system deps for Kafka
       run: |
-       sudo apt-get update
-       sudo apt-get install -y librdkafka-dev
+        sudo apt-get update
+        sudo apt-get install -y librdkafka-dev
 
     - name: Install dependencies
       run: |
-       pip install -r requirements_training.txt
-       pip install "hopsworks[python]"
-       pip install confluent-kafka
+        pip install -r requirements_training.txt
+        pip install "hopsworks[python]"
+        pip install confluent-kafka
 
         
     - name: Run EDA and upload to Hopsworks
       env:
         HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
       run: |
+        # This step runs eda.py, which generates or modifies local files
         python scripts/eda.py
         
     - name: Commit artifacts
       run: |
-       git config --local user.email "action@github.com"
-       git config --local user.name "GitHub Action"
-       git add data/ plots/ 
-       git diff --quiet && git diff --staged --quiet || git commit -m "Update EDA artifacts - $(date +'%Y-%m-%d %H:%M:%S')"
-       git pull --rebase origin main
-       git push
+        # 1. Configure user identity
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # 2. Add all modified/new artifact files
+        git add data/ plots/
+        
+        # 3. Check if there are any staged changes (using diff-index)
+        echo "Checking for changes..."
+        
+        if git diff --cached --quiet; then
+          echo "No changes to commit. EDA artifacts are already up-to-date."
+        else
+          echo "Changes detected. Committing and pushing..."
+          # Commit, rebase (to pull any intervening changes), and push
+          git commit -m "Update EDA artifacts - $(date +'%Y-%m-%d %H:%M:%S')"
+          # Rebase to ensure we handle race conditions before pushing
+          git pull --rebase origin main
+          git push
+          echo "Files pushed successfully."
+        fi
         
     - name: Trigger training workflow
       if: success()
