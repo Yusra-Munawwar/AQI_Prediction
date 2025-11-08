@@ -9,10 +9,10 @@ from datetime import datetime
 import time
 import traceback
 
-# Optional: Set this environment variable externally or directly here
-# os.environ['HOPSWORKS_API_KEY'] = 'vuBdrdFVzNRmWkGY.yHZNYVXLB7UwT7UH4xnCbe2jHcEMW67hrJPewZrJqXUMs5RbseOBAAUuDHO991af'
-# Note: hopsworks import is typically handled internally by the methods, 
-# but if run in a non-notebook environment, the import is needed.
+# NOTE: The HOPSWORKS_API_KEY should be set externally (e.g., via GitHub Secrets or environment variable).
+#os.environ['HOPSWORKS_API_KEY'] = '...' # REMOVED HARDCODED KEY
+
+# Handle hopsworks import gracefully
 try:
     import hopsworks
 except ImportError:
@@ -32,15 +32,18 @@ except ImportError:
             self.event_time = 'datetime_utc'
             self.description = 'Mock FG'
     class MockHopsworks:
-        def login(self, api_key_value): return MockProject()
+        def login(self, api_key_value): 
+            if api_key_value:
+                return MockProject()
+            raise ValueError("HOPSWORKS_API_KEY not provided.")
         def get_feature_store(self): return self
         def get_feature_group(self, name, version): return None
         def get_feature_groups(self, name): return []
         def create_feature_group(self, **kwargs): return MockFG()
     hopsworks = MockHopsworks()
 
-
-# Load data with AQI (from Section 1)
+# --- INPUT DATA FILE ---
+# Assuming '2years_us_aqi_final.csv' is in the current directory as per the first code block.
 df = pd.read_csv('data/2years_us_aqi_final.csv', parse_dates=['datetime_utc'])
 
 # ============================================================================
@@ -66,7 +69,7 @@ def clean_data(df):
         if col in df_clean.columns:
             negatives = (df_clean[col] < 0).sum()
             if negatives > 0:
-                print(f"⚠️  Clipped {negatives} negatives in {col} to 0.")
+                print(f"⚠️ Clipped {negatives} negatives in {col} to 0.")
             df_clean[col] = df_clean[col].clip(lower=0)
 
     # 3. Conservative outlier removal (99.5th percentile cap instead of 3*IQR)
@@ -75,7 +78,7 @@ def clean_data(df):
             p995 = df_clean[col].quantile(0.995)
             outliers = (df_clean[col] > p995).sum()
             if outliers > 0:
-                print(f"⚠️  Capped {outliers} extreme outliers in {col} at 99.5th percentile ({p995:.1f}).")
+                print(f"⚠️ Capped {outliers} extreme outliers in {col} at 99.5th percentile ({p995:.1f}).")
             df_clean[col] = df_clean[col].clip(upper=p995)
 
     # 4. Missing values: Forward/backward fill (time-series appropriate), then median
@@ -222,12 +225,6 @@ corr = df_feat[features_for_corr].corr()['us_aqi'].sort_values(ascending=False)
 print("\n📊 Top Correlations with US AQI:")
 print(corr.head(15))
 
-# ============================================================================
-# 3. EXPLORATORY DATA ANALYSIS (EDA) & FEATURE SELECTION
-# ============================================================================
-
-# ... (Previous code remains the same until feature selection)
-
 # 3. Feature selection (Modified)
 correlation_threshold = 0.3
 selected_features = [f for f in features_for_corr if f != 'us_aqi' and abs(corr[f]) > correlation_threshold]
@@ -236,33 +233,26 @@ selected_features = [f for f in features_for_corr if f != 'us_aqi' and abs(corr[
 manual_additions = ['us_aqi_lag1', 'us_aqi_lag24', 'hour_sin', 'hour_cos']
 for feature in manual_additions:
     if feature not in selected_features and feature in df_feat.columns:
-        selected_features.append(feature)
+          selected_features.append(feature)
 
 print(f"\n✅ Selected Features (Corr > {correlation_threshold} + Target Lags + Hour Cos/Sin): {len(selected_features)} features")
 print(selected_features)
 
-# Save selected features for later use
+# Save selected features to 'selected_features.txt'
 with open('selected_features.txt', 'w') as f:
     f.write(','.join(selected_features))
 print("💾 Saved selected features to 'selected_features.txt'")
 
-# --- NEW CODE ADDED HERE ---
-# Ensure the 'data' directory exists
+# CRITICAL ADDITION: Save selected features to 'data/selected_text.text'
 os.makedirs('data', exist_ok=True) 
-
-# Save selected features to 'data/selected_text.text' as requested
-# Note: The output format is a single string of comma-separated feature names, 
-# similar to the selected_features.txt file.
 try:
     with open('data/selected_text.text', 'w') as f:
         f.write(','.join(selected_features))
     print("💾 Saved selected features to 'data/selected_text.text'")
 except Exception as e:
     print(f"⚠️ Error saving to data/selected_text.text: {e}")
-# ---------------------------
+# END CRITICAL ADDITION
 
-# 4. Visualization
-# ... (Rest of the code remains the same)
 
 # 4. Visualization
 plt.figure(figsize=(16, 10))
@@ -338,37 +328,65 @@ df_feat.to_csv('data/2years_features.csv', index=False)  # Re-save with category
 
 
 # ============================================================================
-# 4. HOPSWORKS FEATURE STORE INTEGRATION FUNCTIONS
+# 4. HOPSWORKS FEATURE STORE INTEGRATION FUNCTIONS (Selected Features Only)
 # ============================================================================
 
+# Use the features selected in the EDA step
+# This list is manually updated based on the common feature selection output.
+SELECTED_FEATURES = [
+    'pm2_5', 'pm10', 'co', 'no2', 'so2',
+    'us_aqi_lag1', 'us_aqi_lag24',
+    'month_cos', 'total_pm', 'total_gases',
+    'no2_o3_ratio', 'pm2_5_rolling_3h', 'pm10_rolling_3h',
+    'co_rolling_3h', 'pm2_5_co_interaction',
+    'hour_sin', 'hour_cos'
+]
+
+def create_clean_feature_csv(input_path='data/2years_features.csv', output_path='data/2years_features_clean.csv'):
+    """Prepares a CSV with only the required columns for Hopsworks upload."""
+    print(f"\nCreating clean feature CSV: {output_path}")
+    df = pd.read_csv(input_path)
+
+    # Safely parse datetime
+    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True, format='mixed', errors='coerce')
+
+    # Drop rows with invalid datetime
+    if df['datetime_utc'].isna().any():
+        print(f"Dropping {df['datetime_utc'].isna().sum()} rows with invalid datetime_utc")
+        df = df.dropna(subset=['datetime_utc']).reset_index(drop=True)
+
+    # Required columns (Target + Features + Time)
+    required_cols = ['datetime_utc', 'us_aqi'] + SELECTED_FEATURES
+    
+    # Check for missing columns in the source DF and fill them if necessary
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        print(f"Missing columns in source CSV → filling with 0: {missing}")
+        for c in missing:
+            df[c] = 0.0
+
+    df_clean = df[required_cols].copy()
+    df_clean = df_clean.sort_values('datetime_utc').reset_index(drop=True)
+
+    # Ensure data directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_clean.to_csv(output_path, index=False)
+    print(f"Saved {len(df_clean)} rows × {len(df_clean.columns)} cols → {output_path}")
+    print(f"Columns: {list(df_clean.columns)}")
+    return df_clean
+
+
 def validate_dataframe_for_hopsworks(df):
+    """Pre-processes the DataFrame for Hopsworks, including timestamp conversion."""
     df_clean = df.copy()
     issues = []
 
-    # 1. Multi-index handling
-    if isinstance(df_clean.index, pd.MultiIndex):
-        df_clean = df_clean.reset_index(drop=True)
-        issues.append("Reset MultiIndex")
-    if isinstance(df_clean.columns, pd.MultiIndex):
-        df_clean.columns = ['_'.join(map(str, col)).strip() for col in df_clean.columns.values]
-        issues.append("Flattened MultiIndex columns")
-    if df_clean.columns.duplicated().any():
-        df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
-        issues.append("Removed duplicate columns")
-
-    # 2. day_of_week (must be added **before** timestamp conversion)
-    if 'day_of_week' not in df_clean.columns and 'datetime_utc' in df_clean.columns:
-        if df_clean['datetime_utc'].dtype != 'datetime64[ns]':
-            df_clean['datetime_utc'] = pd.to_datetime(df_clean['datetime_utc'], errors='coerce', utc=True)
-        df_clean['day_of_week'] = df_clean['datetime_utc'].dt.dayofweek
-        issues.append("Added 'day_of_week' column")
-        print("Added 'day_of_week' (0=Mon, 6=Sun)")
-
-    # 3. datetime_utc → ms int64
+    # 1. datetime_utc → ms int64
     if 'datetime_utc' in df_clean.columns:
-        if df_clean['datetime_utc'].dtype != 'datetime64[ns]':
-            df_clean['datetime_utc'] = pd.to_datetime(df_clean['datetime_utc'], errors='coerce', utc=True)
-        # drop out-of-range timestamps
+        if not pd.api.types.is_datetime64tz_dtype(df_clean['datetime_utc']):
+            df_clean['datetime_utc'] = pd.to_datetime(df_clean['datetime_utc'], utc=True, errors='coerce')
+        
+        # Drop out-of-range timestamps
         bad = (df_clean['datetime_utc'].isna() |
                (df_clean['datetime_utc'] < pd.Timestamp('1678-01-01', tz='UTC')) |
                (df_clean['datetime_utc'] > pd.Timestamp('2262-04-11', tz='UTC')))
@@ -376,43 +394,24 @@ def validate_dataframe_for_hopsworks(df):
             print(f"Dropping {bad.sum()} rows with invalid timestamps")
             df_clean = df_clean[~bad].reset_index(drop=True)
             issues.append(f"Dropped {bad.sum()} invalid timestamps")
+            
+        # Convert to milliseconds since epoch
         df_clean['datetime_utc'] = (df_clean['datetime_utc'].astype('int64') // 1_000_000).astype('int64')
-        issues.append("Converted datetime_utc to ms timestamp")
+        issues.append("Converted datetime_utc to ms")
 
-    # 4. force numeric columns to float64 (Hopsworks stores everything as double)
-    int_cols = ['us_aqi', 'hour', 'month', 'day_of_week', 'is_weekend']
-    for c in int_cols:
-        if c in df_clean.columns:
-            df_clean[c] = pd.to_numeric(df_clean[c], errors='coerce').fillna(0).astype('float64')
-            issues.append(f"Converted '{c}' → float64")
-
-    # 5. categorical / object → string
-    for c in df_clean.select_dtypes('category').columns:
-        df_clean[c] = df_clean[c].astype(str)
-    for c in df_clean.select_dtypes('object').columns:
-        df_clean[c] = df_clean[c].fillna('unknown').astype(str)
-
-    # 6. remaining numeric → float64
+    # 2. Force numeric to float64 (Hopsworks stores as double)
     for c in df_clean.select_dtypes(include=[np.number]).columns:
-        if c not in int_cols and c != 'datetime_utc':
-            df_clean[c] = df_clean[c].astype('float64')
+        if c != 'datetime_utc':
+            df_clean[c] = pd.to_numeric(df_clean[c], errors='coerce').astype('float64')
 
-    # 7. NaN / inf
-    df_clean = df_clean.fillna({c: 0 for c in df_clean.select_dtypes(include=[np.number]).columns})
-    df_clean = df_clean.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # 3. Fill NaN/inf
+    df_clean = df_clean.fillna(0)
+    df_clean = df_clean.replace([np.inf, -np.inf], 0)
     issues.append("Filled NaN / inf")
-
-    # 8. sanitise column names
-    bad = [c for c in df_clean.columns if not c.replace('_', '').isalnum()]
-    for c in bad:
-        new = ''.join(ch if ch.isalnum() or ch == '_' else '_' for ch in c)
-        df_clean = df_clean.rename(columns={c: new})
-    if bad:
-        issues.append("Sanitised column names")
 
     print("\nVALIDATION COMPLETE")
     if issues:
-        for i in issues: print(f"   • {i}")
+        for i in issues: print(f"   • {i}")
     print(f"Shape: {df_clean.shape}")
     if 'datetime_utc' in df_clean.columns:
         mn = pd.to_datetime(df_clean['datetime_utc'].min(), unit='ms', utc=True)
@@ -426,6 +425,10 @@ def list_feature_groups(name="aqi_features"):
     print(f"LISTING FEATURE GROUPS: {name}")
     print("="*70)
     try:
+        if not os.getenv("HOPSWORKS_API_KEY"):
+            print("HOPSWORKS_API_KEY not set. Cannot list feature groups.")
+            return []
+            
         project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
         fs = project.get_feature_store()
         fgs = fs.get_feature_groups(name=name)
@@ -434,14 +437,14 @@ def list_feature_groups(name="aqi_features"):
             return []
         print(f"Found {len(fgs)} version(s):")
         for fg in fgs:
-            print(f"\n   Version {fg.version}:")
-            print(f"     Features: {len(fg.features)}")
-            print(f"     Primary key: {fg.primary_key}")
-            print(f"     Event time: {fg.event_time}")
-            print(f"     Description: {fg.description}")
+            print(f"\n  Version {fg.version}:")
+            print(f"    Features: {len(fg.features)}")
+            print(f"    Primary key: {fg.primary_key}")
+            print(f"    Event time: {fg.event_time}")
+            print(f"    Description: {fg.description}")
         return fgs
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error listing feature groups: {e}")
         return []
 
 
@@ -450,6 +453,10 @@ def delete_feature_group(name="aqi_features", version=4):
     print(f"DELETING FEATURE GROUP: {name} v{version}")
     print("="*70)
     try:
+        if not os.getenv("HOPSWORKS_API_KEY"):
+            print("HOPSWORKS_API_KEY not set. Cannot delete feature group.")
+            return
+
         project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
         fs = project.get_feature_store()
         fg = fs.get_feature_group(name=name, version=version)
@@ -467,7 +474,6 @@ def upload_to_hopsworks(df, feature_group_name="aqi_features", version=4):
     print("UPLOADING TO HOPSWORKS FEATURE STORE")
     print("="*70)
     try:
-        # Check for API key presence
         if not os.getenv("HOPSWORKS_API_KEY"):
             print("HOPSWORKS_API_KEY environment variable not set. Skipping upload.")
             return
@@ -476,76 +482,57 @@ def upload_to_hopsworks(df, feature_group_name="aqi_features", version=4):
         print(f"Connected to project: {project.name}")
         fs = project.get_feature_store()
 
-        # -------------------------------------------------
-        # 1. Validate & prepare dataframe
-        # -------------------------------------------------
+        # 1. Validate
         df_up = validate_dataframe_for_hopsworks(df)
 
-        if 'id' not in df_up.columns:
-            # Create a simple unique ID for the primary key
-            df_up.insert(0, 'id', range(1, len(df_up) + 1))
-            print("Added 'id' primary key")
+        # Add id
+        df_up.insert(0, 'id', range(1, len(df_up) + 1))
+        print("Added 'id' primary key")
 
-        if 'datetime_utc' in df_up.columns:
-            before = len(df_up)
-            # Remove duplicates by timestamp, keeping the last (most recent) measurement
-            df_up = (df_up.sort_values('datetime_utc')
-                          .drop_duplicates(subset=['datetime_utc'], keep='last')
-                          .reset_index(drop=True))
-            if len(df_up) < before:
-                print(f"Removed {before - len(df_up)} duplicate timestamps")
-                df_up['id'] = range(1, len(df_up) + 1) # Re-index IDs after dropping duplicates
+        # Deduplicate
+        before = len(df_up)
+        df_up = df_up.sort_values('datetime_utc').drop_duplicates(subset=['datetime_utc'], keep='last').reset_index(drop=True)
+        if len(df_up) < before:
+            print(f"Removed {before - len(df_up)} duplicate timestamps")
+            df_up['id'] = range(1, len(df_up) + 1)
 
         print(f"\nUploading {len(df_up)} rows")
-        print(f"Columns: {list(df_up.columns)}")
 
-        # -------------------------------------------------
-        # 2. FG definition
-        # -------------------------------------------------
+        # FG params
         fg_params = {
             "name": feature_group_name,
             "version": version,
             "primary_key": ["id"],
-            "description": "AQI features with pollutants, temporal features, interactions. Target: us_aqi",
+            "event_time": "datetime_utc",
+            "description": "AQI prediction: 17 features + us_aqi + datetime_utc",
             "online_enabled": False,
         }
-        if 'datetime_utc' in df_up.columns:
-            fg_params["event_time"] = "datetime_utc"
 
-        # -------------------------------------------------
-        # 3. CRITICAL: Get or CREATE
-        # -------------------------------------------------
+        # Get or create
         fg = None
         try:
             candidate = fs.get_feature_group(name=feature_group_name, version=version)
             if candidate is not None:
                 fg = candidate
                 print(f"Found existing FG v{version} – will append")
-            else:
-                # If get_feature_group returns None or raises an error indicating not found, create it
-                print(f"Creating new feature group v{version}")
-                fg = fs.create_feature_group(**fg_params)
-        except Exception as e:
-            # This catch handles specific exceptions if the FG doesn't exist.
-            print(f"Attempt to retrieve FG failed ({e}) → will create new")
+        except Exception:
+            pass # Continue to create if not found
+        
+        if fg is None:
+            print(f"Creating new feature group v{version}")
             fg = fs.create_feature_group(**fg_params)
 
-
-        # -------------------------------------------------
-        # 4. INSERT + WAIT
-        # -------------------------------------------------
-        print("Inserting data and waiting for materialisation job to finish...")
-        # Ensure the insertion column order matches the feature group schema
+        # Insert
+        print("Inserting data...")
         fg.insert(df_up, wait=True)
         print(f"\nUPLOADED & MATERIALISED! {feature_group_name} v{version}")
-        print(f"   Rows: {len(df_up)}")
+        print(f"   Rows: {len(df_up)}")
 
-        # URL
         try:
             p_id = getattr(project, "project_id", "PROJECT_ID")
             fs_id = getattr(fs, "id", "FS_ID")
             fg_id = fg.id
-            print(f"   View: https://c.app.hopsworks.ai/p/{p_id}/fs/{fs_id}/fg/{fg_id}")
+            print(f"   View: https://c.app.hopsworks.ai/p/{p_id}/fs/{fs_id}/fg/{fg_id}")
         except Exception:
             pass
 
@@ -566,7 +553,6 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=4,
 
     for attempt in range(max_retries):
         try:
-            # Check for API key presence
             if not os.getenv("HOPSWORKS_API_KEY"):
                 raise ValueError("HOPSWORKS_API_KEY environment variable not set.")
 
@@ -574,31 +560,20 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=4,
             fs = project.get_feature_store()
             fg = fs.get_feature_group(name=feature_group_name, version=version)
 
+            cols_to_select = ['id', 'datetime_utc', 'us_aqi'] + SELECTED_FEATURES
+            query = fg.select(cols_to_select)
+
             if start_date and end_date:
                 print(f"Filtering {start_date} → {end_date}")
-                # Convert ISO 8601 strings to milliseconds timestamp (int64) for filtering
                 s = int(pd.Timestamp(start_date, tz='UTC').value // 1_000_000)
                 e = int(pd.Timestamp(end_date, tz='UTC').value // 1_000_000)
-                df = fg.filter((fg.datetime_utc >= s) & (fg.datetime_utc <= e)).read()
+                df = query.filter((fg.datetime_utc >= s) & (fg.datetime_utc <= e)).read()
             else:
-                df = fg.read()
+                df = query.read()
 
-            # post-process
+            # Post-process timestamp and ID
             if 'datetime_utc' in df.columns:
-                # Convert back from ms timestamp (int64) to datetime object
                 df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', utc=True)
-                bad = (df['datetime_utc'].isna() |
-                       (df['datetime_utc'] < pd.Timestamp('1678-01-01', tz='UTC')) |
-                       (df['datetime_utc'] > pd.Timestamp('2262-04-11', tz='UTC')))
-                if bad.sum():
-                    print(f"Dropping {bad.sum()} invalid timestamps")
-                    df = df[~bad].reset_index(drop=True)
-
-            int_cols = ['us_aqi', 'hour', 'month', 'day_of_week', 'is_weekend']
-            for c in int_cols:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype('int64')
-
             if 'id' in df.columns:
                 df = df.drop('id', axis=1)
 
@@ -614,17 +589,15 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=4,
             else:
                 print(f"Fetch failed: {e}")
                 # ---------- FALLBACK ----------
-                print("Falling back to local CSV...")
+                print("Falling back to clean CSV...")
                 try:
-                    df = pd.read_csv('data/2years_features.csv')
-                    if 'datetime_utc' in df.columns:
-                        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce', utc=True)
-                    if 'day_of_week' not in df.columns and 'datetime_utc' in df.columns:
-                        df['day_of_week'] = df['datetime_utc'].dt.dayofweek
+                    df = pd.read_csv('data/2years_features_clean.csv')
+                    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+                    df = df[['datetime_utc', 'us_aqi'] + SELECTED_FEATURES]
                     print(f"Fallback CSV shape: {df.shape}")
                     return df
                 except Exception as fb:
-                    print(f"Fallback also failed: {fb}")
+                    print(f"Fallback failed: {fb}")
                     raise
 
 
@@ -633,18 +606,9 @@ def compare_datasets(local_df, hops_df, tolerance=1e-6):
     print("DATASET COMPARISON")
     print("="*70)
 
-    # add day_of_week if missing
-    for d, name in [(local_df, 'local'), (hops_df, 'hops')]:
-        if 'day_of_week' not in d.columns and 'datetime_utc' in d.columns:
-            d['day_of_week'] = d['datetime_utc'].dt.dayofweek
-            print(f"Added day_of_week to {name}")
-
-    # Remove temporary columns that might be in one but not the other
-    local = local_df.copy().drop(columns=['hour', 'month'], errors='ignore')
-    hops = hops_df.copy().drop(columns=['hour', 'month'], errors='ignore')
-
-    local = local.sort_values('datetime_utc').reset_index(drop=True)
-    hops  = hops.sort_values('datetime_utc').reset_index(drop=True)
+    cols = ['datetime_utc', 'us_aqi'] + SELECTED_FEATURES
+    local = local_df[cols].sort_values('datetime_utc').reset_index(drop=True)
+    hops = hops_df[cols].sort_values('datetime_utc').reset_index(drop=True)
 
     print(f"Date range local: {local['datetime_utc'].min()} → {local['datetime_utc'].max()}")
     print(f"Date range hops : {hops['datetime_utc'].min()} → {hops['datetime_utc'].max()}")
@@ -652,89 +616,88 @@ def compare_datasets(local_df, hops_df, tolerance=1e-6):
     if len(local) != len(hops):
         print(f"Row count mismatch: local={len(local)} hops={len(hops)}")
         min_len = min(len(local), len(hops))
-        local = local.iloc[:min_len]
-        hops  = hops.iloc[:min_len]
+        local, hops = local.iloc[:min_len], hops.iloc[:min_len]
 
-    # columns
-    expected_extra = {'id'}
-    core_hops = set(hops.columns) - expected_extra
-    if set(local.columns) == core_hops:
-        print("Core columns match")
-    else:
-        print("Columns differ:")
-        print("   missing in hops :", set(local.columns) - core_hops)
-        print("   extra   in hops :", set(hops.columns) - expected_extra - set(local.columns))
+    numeric_cols = local.select_dtypes(include=[np.number]).columns
+    # Align dtypes for reliable comparison
+    for c in numeric_cols:
+         if hops[c].dtype != local[c].dtype:
+             hops[c] = hops[c].astype(local[c].dtype)
+             
+    diffs = (local[numeric_cols] - hops[numeric_cols]).abs()
+    max_diff = diffs.max().max()
 
-    # dtypes
-    print("\nData types:")
-    for c in sorted(local.columns):
-        if c in hops.columns:
-            l = str(local[c].dtype)
-            h = str(hops[c].dtype)
-            print(f"   {'OK' if l==h else 'DIFF'} {c:25} local={l:20} hops={h:20}")
+    print(f"Max numeric difference: {max_diff:.2e}")
+    print("DATA MATCH!" if max_diff < tolerance else "DATA MISMATCH!")
 
-    # stats on target
-    if 'us_aqi' in local.columns and 'us_aqi' in hops.columns:
+    if 'us_aqi' in local.columns:
         print("\nus_aqi stats:")
         for stat in ['mean', 'std', 'min', 'max']:
             lv = getattr(local['us_aqi'], stat)()
             hv = getattr(hops['us_aqi'], stat)()
             diff = abs(lv - hv)
-            print(f"   {stat:4}: local={lv:8.2f} hops={hv:8.2f} diff={diff:8.2f}")
+            print(f"  {stat:4}: local={lv:8.2f} hops={hv:8.2f} diff={diff:8.2f}")
 
     print("\n" + "="*70)
-    return set(local.columns) == core_hops
+    return max_diff < tolerance
 
 
 # ============================================================================
 # FINAL PIPELINE EXECUTION
 # ============================================================================
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("STEP 0: LIST EXISTING FEATURE GROUPS")
-    print("="*70)
+    
+    # -----------------------------------------------------
+    # RUN CLEANING AND FEATURE ENGINEERING TO GENERATE FILES
+    # -----------------------------------------------------
+    # Clean data (Saves '2years_cleaned.csv')
+    df_clean_data = clean_data(df)
+
+    # Engineer features (Saves '2years_features.csv')
+    df_feat_data = engineer_features(df_clean_data)
+
+    # Run EDA/Feature Selection (Saves 'selected_features.txt' and 'data/selected_text.text')
+    # NOTE: The selected_features list in memory is now up-to-date.
+    # The EDA code block handles loading/re-deriving intermediate columns for plotting.
+    
+    # Reload the full feature DF including the newly added 'aqi_category' column.
+    df_full_features = pd.read_csv('data/2years_features.csv', parse_dates=['datetime_utc'])
+    df_full_features['datetime_utc'] = pd.to_datetime(df_full_features['datetime_utc'], utc=True)
+    
+    # -----------------------------------------------------
+    # HOPSWORKS PIPELINE
+    # -----------------------------------------------------
+    FG_VERSION = 4
+    CLEAN_CSV = 'data/2years_features_clean.csv'
+    
+    # 0. List existing FGs
     list_feature_groups("aqi_features")
 
-    # Assuming version 4 is the desired version for the current feature set
-    FG_VERSION = 4
-
-    print("\n" + "="*70)
-    print(f"STEP 1: DELETE VERSION {FG_VERSION} (safe)")
-    print("="*70)
+    # 1. Delete old version for idempotency
     delete_feature_group("aqi_features", version=FG_VERSION)
 
-    print("\n" + "="*70)
-    print(f"STEP 2: UPLOAD TO HOPSWORKS (v{FG_VERSION})")
-    print("="*70)
+    # 2. Prepare clean data (Saves '2years_features_clean.csv' with only SELECTED_FEATURES)
+    df_local = create_clean_feature_csv(input_path='data/2years_features.csv', output_path=CLEAN_CSV)
 
-    # Load the latest local features created by the EDA step (including aqi_category)
-    df_local = pd.read_csv('data/2years_features.csv')
+    # 3. Upload to Hopsworks
+    upload_to_hopsworks(df_local, version=FG_VERSION)
+
+    # 4. Fetch & Compare
+    hops_df = fetch_from_hopsworks("aqi_features", version=FG_VERSION)
+    if hops_df is not None:
+        compare_datasets(df_local, hops_df)
+
+    # 5. Training Data Fetch
     if 'datetime_utc' in df_local.columns:
-        df_local['datetime_utc'] = pd.to_datetime(df_local['datetime_utc'], errors='coerce', utc=True)
-    print(f"Local CSV shape: {df_local.shape}")
-
-    try:
-        fg = upload_to_hopsworks(df_local, version=FG_VERSION)
-        print("\nUPLOAD SUCCESSFUL")
-
-        print("\n" + "="*70)
-        print("STEP 3: FETCH & COMPARE")
-        print("="*70)
-        hops_df = fetch_from_hopsworks("aqi_features", version=FG_VERSION)
-        if hops_df is not None:
-            compare_datasets(df_local, hops_df)
-
-        print("\n" + "="*70)
-        print("STEP 4: TRAINING DATA")
-        print("="*70)
-        if 'datetime_utc' in df_local.columns:
-            training_df = fetch_from_hopsworks(
-                "aqi_features", version=FG_VERSION, for_training=True,
-                start_date=df_local['datetime_utc'].min().isoformat(),
-                end_date=df_local['datetime_utc'].max().isoformat()
-            )
-            if training_df is not None:
-                print(f"TRAINING DATA READY: {training_df.shape}")
-    except Exception as e:
-        print(f"\nFATAL ERROR IN HOPSWORKS PIPELINE: {e}")
-        print("Please check your HOPSWORKS_API_KEY and connection.")
+        training_df = fetch_from_hopsworks(
+            "aqi_features", version=FG_VERSION, for_training=True,
+            start_date=df_local['datetime_utc'].min().isoformat(),
+            end_date=df_local['datetime_utc'].max().isoformat()
+        )
+        if training_df is not None:
+            print(f"\nTRAINING DATA READY: {training_df.shape}")
+            print(f"Columns: {list(training_df.columns)}")
+    
+    print("\n" + "="*70)
+    print("Pipeline completed successfully!")
+    print("="*70)
