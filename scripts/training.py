@@ -525,7 +525,7 @@ if 'best_checkpoint' in predictions:
 cols.append('Closest_Model')
 
 df_pred = pd.DataFrame(predictions)[cols]
-df_pred.to_csv("future_aqi_predictions.csv", index=False)
+df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
 print("Saved: future_aqi_predictions.csv")
 
 # ----------------------------------------------------------------------
@@ -549,7 +549,7 @@ for name in [n for n in model_names if n in df_pred.columns]:
     })
 
 df_metrics = pd.DataFrame(metrics_list)
-df_metrics.to_csv("future_prediction_comparison.csv", index=False)
+df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
 print("Saved: future_prediction_comparison.csv")
 print("\n" + df_metrics.to_string(index=False))
 
