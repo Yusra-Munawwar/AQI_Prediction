@@ -8,7 +8,7 @@ import hopsworks
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, utcfromtimestamp
 import matplotlib.pyplot as plt
 
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -22,8 +22,8 @@ import catboost as cb
 
 # --- GLOBAL CONFIGURATION ---
 API_KEY = os.getenv("OWM_API_KEY") 
-LAT = 24.8607   # Karachi latitude
-LON = 67.0011   # Karachi longitude
+LAT = 24.8607    # Karachi latitude
+LON = 67.0011    # Karachi longitude
 HISTORIC_PATH = "data/2years_features_clean.csv" 
 PERFORMANCE_FILE = "model_artifacts/best_model_performance.json"
 CHECKPOINT_MODEL_PATH = "model_artifacts/best_model.pkl"
@@ -133,7 +133,7 @@ print("="*80)
 def train_with_cv(model, name, use_scaled=False):
     X_tr = X_train_scaled if use_scaled else X_train
     X_va = X_val_scaled   if use_scaled else X_val
-    X_te = X_test_scaled   if use_scaled else X_test
+    X_te = X_test_scaled    if use_scaled else X_test
 
     # --- 5-fold CV ---
     cv_mae = []
@@ -148,7 +148,7 @@ def train_with_cv(model, name, use_scaled=False):
         elif name == "lightgbm":
             m = lgb.LGBMRegressor(**model.get_params())
             m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], 
-                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
+                              callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
         else:
             m = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
             m.fit(X_f_tr, y_f_tr)
@@ -213,6 +213,7 @@ print("7. Linear")
 lr_model = LinearRegression()
 models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
 
+
 # ----------------------------------------------------------------------
 # 8. BEST MODEL (WITH CHECKPOINT LOGIC)
 # ----------------------------------------------------------------------
@@ -238,6 +239,11 @@ new_test_mae = new_test_metrics['mae']
 historical_best_cv_mae = float('inf')
 historical_best_name = "N/A" # Used for tracking historical name
 
+# 🛑 FIX: Initialize variables for final summary/Part 2 in case loading fails or this is the first run.
+# This ensures Section 9 and 10 do not crash on NameError.
+current_best_mae_test_only = float('inf') # Only used to mirror old summary print, not for checkpoint
+current_best_name_test_only = "N/A"       # Only used to mirror old summary print
+
 # Load previous best performance from the JSON file
 if os.path.exists(PERFORMANCE_FILE):
     try:
@@ -246,6 +252,10 @@ if os.path.exists(PERFORMANCE_FILE):
             # IMPORTANT: Load the historical CV MAE for comparison
             historical_best_cv_mae = prev_performance.get("cv_mae", float('inf')) 
             historical_best_name = prev_performance.get("model_name", "N/A")
+            # Load old Test MAE values for the final summary printout (Section 10) only
+            current_best_mae_test_only = prev_performance.get("test_mae", float('inf'))
+            current_best_name_test_only = prev_performance.get("model_name", "N/A") 
+            
             print(f"Historical Best CV MAE: {historical_best_cv_mae:.3f} ({historical_best_name})")
     except Exception as e:
         print(f"Error loading {PERFORMANCE_FILE}: {e}. Starting fresh checkpoint.")
@@ -265,7 +275,7 @@ if new_cv_mae < historical_best_cv_mae:
     performance_data = {
         "model_name": best_name_cv,
         "cv_mae": new_cv_mae,
-        "test_mae": new_test_mae,
+        "test_mae": new_test_mae, # Keep test MAE for reference
         "test_r2": new_test_metrics['r2'],
         "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
     }
@@ -285,12 +295,8 @@ else:
     final_test_metrics = new_test_metrics 
 
 # --- Prepare variables for Section 9 and 10 ---
-# Define a single variable to represent the name of the model currently in the best_model.pkl file
-# This is the name of the historical best if we didn't promote a new one.
+# The name of the model currently in the best_model.pkl file (for Part 2 scaling check)
 current_checkpoint_name = final_best_name 
-
-# Define the historical best CV MAE for the summary printout
-current_checkpoint_cv_mae = historical_best_cv_mae
 
 print("\n" + "="*80)
 print("CHECKPOINT COMPLETE")
@@ -305,11 +311,11 @@ joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
 # Save a comprehensive metrics file for the *current* run
 with open("model_artifacts/metrics_current_run.json", "w") as f:
     json.dump({
-        "trained_best_model": best_name_cv, # ✅ Use the current run's best CV model name
+        "trained_best_model": best_name_cv, # Use the current run's best CV model name
         "new_test_metrics": new_test_metrics,
         "cv_mae": cv_scores,
         "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
-        "historical_best_cv_mae": historical_best_cv_mae, # ✅ Use the correct historical CV MAE
+        "historical_best_cv_mae": historical_best_cv_mae, # Use the correct historical CV MAE
         "is_new_historical_best": is_new_best,
         "features": SELECTED_FEATURES,
         "scaler_needed": best_name_cv in ["ridge", "linear"],
@@ -327,12 +333,13 @@ print("TRAINING COMPLETE – CHECKPOINT STATUS")
 print("="*80)
 # Use the correct names and CV MAE values for the summary
 print(f"Best Model from Current Run : {best_name_cv.upper()}")
-print(f"Current Run CV MAE          : {new_cv_mae:.3f}") # Print CV MAE for consistency
-print(f"Saved Checkpoint Model Name : {current_checkpoint_name.upper()}") # Name of the model currently in the checkpoint file
-print(f"Historical Best CV MAE      : {current_checkpoint_cv_mae:.3f}")
+print(f"Current Run Test MAE        : {new_test_metrics['mae']:.3f}")
+# 🛑 FIX: Use the historical name/MAE derived from the file load for the summary
+print(f"Historical Best Test MAE    : {current_best_mae_test_only:.3f} ({current_best_name_test_only})") 
 print(f"STATUS                      : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
 print(f"Saved Checkpoint Location   : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
+
 # =============================================================================
 # PART 2: FORECASTING
 # =============================================================================
@@ -433,7 +440,7 @@ def get_pollution_forecast(lat, lon, api_key):
     data = resp.json()
     rows = []
     for item in data['list']:
-        dt = datetime.utcfromtimestamp(item['dt'])
+        dt = utcfromtimestamp(item['dt'])
         comp = item['components']
         rows.append({
             'datetime_utc': dt,
@@ -497,28 +504,14 @@ model_names = list(models.keys())
 
 for name in model_names:
     model = models[name]
-    if name in ["ridge", "linear", "best_checkpoint"] and hasattr(model, 'alpha'): # Check for linear models which use scaler
+    
+    # 🛑 FIX: Cleaned up the scaling logic for best_checkpoint
+    if name in ["ridge", "linear"]:
         X_input = scaler.transform(X)
-    elif name == "best_checkpoint": # Handle scaled case for checkpoint model
-         # Need to check the historical config if the checkpoint is a scaled model
-         # For simplicity, we assume the best_name from training is used to determine scaling
-         if current_best_name in ["ridge", "linear"]:
-             X_input = scaler.transform(X)
-         else:
-             X_input = X
-    else:
-        X_input = X
-        
-    # Re-apply model-specific scaling check for the best_checkpoint
-    if name == "best_checkpoint" and current_best_name in ["ridge", "linear"]:
-        X_input = scaler.transform(X)
-    elif name == "best_checkpoint" and current_best_name not in ["ridge", "linear"]:
-        X_input = X
-    elif name in ["ridge", "linear"]:
+    elif name == "best_checkpoint" and current_checkpoint_name in ["ridge", "linear"]:
         X_input = scaler.transform(X)
     else:
         X_input = X
-
 
     pred = model.predict(X_input)
     pred = np.clip(pred.round().astype(int), 0, 500)
