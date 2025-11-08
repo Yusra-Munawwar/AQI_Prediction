@@ -213,7 +213,6 @@ print("7. Linear")
 lr_model = LinearRegression()
 models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
 
-
 # ----------------------------------------------------------------------
 # 8. BEST MODEL (WITH CHECKPOINT LOGIC)
 # ----------------------------------------------------------------------
@@ -237,7 +236,7 @@ new_test_mae = new_test_metrics['mae']
 
 # --- CHECKPOINT LOGIC (PRIORITIZING CV MAE) ---
 historical_best_cv_mae = float('inf')
-historical_best_name = "N/A"
+historical_best_name = "N/A" # Used for tracking historical name
 
 # Load previous best performance from the JSON file
 if os.path.exists(PERFORMANCE_FILE):
@@ -265,8 +264,8 @@ if new_cv_mae < historical_best_cv_mae:
     # 2. Update the performance tracking file with the new CV metrics
     performance_data = {
         "model_name": best_name_cv,
-        "cv_mae": new_cv_mae, # Now tracking CV MAE
-        "test_mae": new_test_mae, # Keep test MAE for reference
+        "cv_mae": new_cv_mae,
+        "test_mae": new_test_mae,
         "test_r2": new_test_metrics['r2'],
         "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
     }
@@ -283,11 +282,20 @@ else:
     is_new_best = False
     # Use the historical name/metrics for the final summary if we kept the old model
     final_best_name = historical_best_name 
-    final_test_metrics = new_test_metrics # Use the current run's metrics for the current run summary
-    
+    final_test_metrics = new_test_metrics 
+
+# --- Prepare variables for Section 9 and 10 ---
+# Define a single variable to represent the name of the model currently in the best_model.pkl file
+# This is the name of the historical best if we didn't promote a new one.
+current_checkpoint_name = final_best_name 
+
+# Define the historical best CV MAE for the summary printout
+current_checkpoint_cv_mae = historical_best_cv_mae
+
 print("\n" + "="*80)
 print("CHECKPOINT COMPLETE")
 print("="*80)
+
 
 # ----------------------------------------------------------------------
 # 9. SAVE ALL METRICS & CONFIG
@@ -297,14 +305,14 @@ joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
 # Save a comprehensive metrics file for the *current* run
 with open("model_artifacts/metrics_current_run.json", "w") as f:
     json.dump({
-        "trained_best_model": best_name,
+        "trained_best_model": best_name_cv, # ✅ Use the current run's best CV model name
         "new_test_metrics": new_test_metrics,
         "cv_mae": cv_scores,
         "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
-        "historical_best_mae": current_best_mae,
+        "historical_best_cv_mae": historical_best_cv_mae, # ✅ Use the correct historical CV MAE
         "is_new_historical_best": is_new_best,
         "features": SELECTED_FEATURES,
-        "scaler_needed": best_name in ["ridge", "linear"],
+        "scaler_needed": best_name_cv in ["ridge", "linear"],
         "all_models_saved": [f"model_{name}.pkl" for name in models],
         "all_metrics": all_metrics
     }, f, indent=2)
@@ -317,13 +325,14 @@ print(f"Current run metrics saved to model_artifacts/metrics_current_run.json")
 print("\n" + "="*80)
 print("TRAINING COMPLETE – CHECKPOINT STATUS")
 print("="*80)
-print(f"Best Model from Current Run : {best_name.upper()}")
-print(f"Current Run Test MAE        : {new_test_metrics['mae']:.3f}")
-print(f"Historical Best Test MAE    : {current_best_mae:.3f} ({current_best_name})")
+# Use the correct names and CV MAE values for the summary
+print(f"Best Model from Current Run : {best_name_cv.upper()}")
+print(f"Current Run CV MAE          : {new_cv_mae:.3f}") # Print CV MAE for consistency
+print(f"Saved Checkpoint Model Name : {current_checkpoint_name.upper()}") # Name of the model currently in the checkpoint file
+print(f"Historical Best CV MAE      : {current_checkpoint_cv_mae:.3f}")
 print(f"STATUS                      : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
 print(f"Saved Checkpoint Location   : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
-
 # =============================================================================
 # PART 2: FORECASTING
 # =============================================================================
