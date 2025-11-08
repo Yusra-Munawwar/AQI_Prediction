@@ -41,7 +41,7 @@ except ImportError:
 
 
 # Load data with AQI (from Section 1)
-df = pd.read_csv('2years_us_aqi_final.csv', parse_dates=['datetime_utc'])
+df = pd.read_csv('/data/2years_us_aqi_final.csv', parse_dates=['datetime_utc'])
 
 # ============================================================================
 # 1. DATA CLEANING
@@ -94,15 +94,15 @@ def clean_data(df):
 df_clean = clean_data(df)
 
 # Save cleaned data
-df_clean.to_csv('2years_cleaned.csv', index=False)
-print("💾 Saved to '2years_cleaned.csv'")
+df_clean.to_csv('/data/2years_cleaned.csv', index=False)
+print("💾 Saved to '/data/2years_cleaned.csv'")
 
 
 # ============================================================================
 # 2. FEATURE ENGINEERING
 # ============================================================================
 # Reload cleaned data for safety, although df_clean is available
-df_clean = pd.read_csv('2years_cleaned.csv', parse_dates=['datetime_utc'])
+df_clean = pd.read_csv('/data/2years_cleaned.csv', parse_dates=['datetime_utc'])
 
 def engineer_features(df):
     """
@@ -171,8 +171,8 @@ def engineer_features(df):
 df_feat = engineer_features(df_clean)
 
 # Save
-df_feat.to_csv('2years_features.csv', index=False)
-print("💾 Saved to '2years_features.csv'")
+df_feat.to_csv('/data/2years_features.csv', index=False)
+print("💾 Saved to '/data/2years_features.csv'")
 
 # Preview key columns
 print("\nPreview of engineered features:")
@@ -185,7 +185,7 @@ print(df_feat[['datetime_utc', 'us_aqi', 'us_aqi_lag1', 'us_aqi_lag24', 'pm2_5',
 # ============================================================================
 
 # Load features (reloading from saved CSV ensures integrity)
-df_feat = pd.read_csv('2years_features.csv', parse_dates=['datetime_utc'])
+df_feat = pd.read_csv('/data/2years_features.csv', parse_dates=['datetime_utc'])
 
 # =================================================================
 # FIX: Re-derive 'month' and 'hour' from datetime_utc for plotting
@@ -310,7 +310,7 @@ df_feat['aqi_category'] = pd.cut(df_feat['us_aqi'],
                                  bins=[0, 50, 100, 150, 200, 300, 500],
                                  labels=['Good', 'Moderate', 'Unhealthy-SG', 'Unhealthy', 'Very Unhealthy', 'Hazardous'])
 
-df_feat.to_csv('2years_features.csv', index=False)  # Re-save with category
+df_feat.to_csv('/data/2years_features.csv', index=False)  # Re-save with category
 
 
 # ============================================================================
@@ -592,7 +592,7 @@ def fetch_from_hopsworks(feature_group_name="aqi_features", version=4,
                 # ---------- FALLBACK ----------
                 print("Falling back to local CSV...")
                 try:
-                    df = pd.read_csv('2years_features.csv')
+                    df = pd.read_csv('/data/2years_features.csv')
                     if 'datetime_utc' in df.columns:
                         df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce', utc=True)
                     if 'day_of_week' not in df.columns and 'datetime_utc' in df.columns:
@@ -684,7 +684,7 @@ if __name__ == "__main__":
     print("="*70)
 
     # Load the latest local features created by the EDA step (including aqi_category)
-    df_local = pd.read_csv('2years_features.csv')
+    df_local = pd.read_csv('/data/2years_features.csv')
     if 'datetime_utc' in df_local.columns:
         df_local['datetime_utc'] = pd.to_datetime(df_local['datetime_utc'], errors='coerce', utc=True)
     print(f"Local CSV shape: {df_local.shape}")
