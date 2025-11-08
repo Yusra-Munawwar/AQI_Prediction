@@ -1,0 +1,6 @@
+{
+  "model_name": "xgboost",
+  "test_mae": 3.346179523005465,
+  "test_r2": 0.97687612592131,
+  "training_date": "2025-11-08 08:51:52 UTC"
+}
