@@ -48,7 +48,7 @@ jobs:
         git config --local user.name "GitHub Action"
         
         # 2. Add all modified/new artifact files
-        git add data/ eda_plots_updated.png selected_features.txt
+        git add data/ eda_plots_updated.png
         
         # 3. Check if there are any staged changes (using diff-index)
         echo "Checking for changes..."
