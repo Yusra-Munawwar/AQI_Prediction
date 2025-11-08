@@ -250,8 +250,18 @@ else:
 
 
 # Compare and save/promote the model
-if new_test_mae < current_best_mae:
-    # A NEW BEST MODEL IS FOUND!
+# Use the best model found by CV for the current run
+best_name_cv = min(cv_scores, key=cv_scores.get)
+new_cv_mae = cv_scores[best_name_cv]
+
+# --- CHECKPOINT LOGIC ---
+current_best_cv_mae = float('inf')
+# Load historical best CV MAE from PERFORMANCE_FILE
+
+# Compare the CURRENT RUN's BEST CV MAE against the HISTORICAL BEST CV MAE
+if new_cv_mae < current_best_cv_mae:
+    # ... save and promote model (using the model determined by CV) ...
+    # Be sure to update the PERFORMANCE_FILE to save the new CV MAE    # A NEW BEST MODEL IS FOUND!
     print("✅ New model is better! Saving as best_model.pkl and updating checkpoint.")
     
     # 1. Save the model as the new official 'best' checkpoint
