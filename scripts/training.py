@@ -8,7 +8,7 @@ import hopsworks
 import os
 import json
 import requests
-from datetime import datetime, utcfromtimestamp
+from datetime import datetime
 import matplotlib.pyplot as plt
 
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
