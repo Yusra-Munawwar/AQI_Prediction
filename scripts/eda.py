@@ -222,6 +222,12 @@ corr = df_feat[features_for_corr].corr()['us_aqi'].sort_values(ascending=False)
 print("\n📊 Top Correlations with US AQI:")
 print(corr.head(15))
 
+# ============================================================================
+# 3. EXPLORATORY DATA ANALYSIS (EDA) & FEATURE SELECTION
+# ============================================================================
+
+# ... (Previous code remains the same until feature selection)
+
 # 3. Feature selection (Modified)
 correlation_threshold = 0.3
 selected_features = [f for f in features_for_corr if f != 'us_aqi' and abs(corr[f]) > correlation_threshold]
@@ -230,7 +236,7 @@ selected_features = [f for f in features_for_corr if f != 'us_aqi' and abs(corr[
 manual_additions = ['us_aqi_lag1', 'us_aqi_lag24', 'hour_sin', 'hour_cos']
 for feature in manual_additions:
     if feature not in selected_features and feature in df_feat.columns:
-         selected_features.append(feature)
+        selected_features.append(feature)
 
 print(f"\n✅ Selected Features (Corr > {correlation_threshold} + Target Lags + Hour Cos/Sin): {len(selected_features)} features")
 print(selected_features)
@@ -239,6 +245,24 @@ print(selected_features)
 with open('selected_features.txt', 'w') as f:
     f.write(','.join(selected_features))
 print("💾 Saved selected features to 'selected_features.txt'")
+
+# --- NEW CODE ADDED HERE ---
+# Ensure the 'data' directory exists
+os.makedirs('data', exist_ok=True) 
+
+# Save selected features to 'data/selected_text.text' as requested
+# Note: The output format is a single string of comma-separated feature names, 
+# similar to the selected_features.txt file.
+try:
+    with open('data/selected_text.text', 'w') as f:
+        f.write(','.join(selected_features))
+    print("💾 Saved selected features to 'data/selected_text.text'")
+except Exception as e:
+    print(f"⚠️ Error saving to data/selected_text.text: {e}")
+# ---------------------------
+
+# 4. Visualization
+# ... (Rest of the code remains the same)
 
 # 4. Visualization
 plt.figure(figsize=(16, 10))
