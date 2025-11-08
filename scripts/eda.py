@@ -239,9 +239,9 @@ print(f"\n✅ Selected Features (Corr > {correlation_threshold} + Target Lags + 
 print(selected_features)
 
 # Save selected features to 'selected_features.txt'
-with open('selected_features.txt', 'w') as f:
+with open('data/selected_features.txt', 'w') as f:
     f.write(','.join(selected_features))
-print("💾 Saved selected features to 'selected_features.txt'")
+print("💾 Saved selected features to 'data/selected_features.txt'")
 
 # CRITICAL ADDITION: Save selected features to 'data/selected_text.text'
 os.makedirs('data', exist_ok=True) 
