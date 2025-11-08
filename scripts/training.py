@@ -1,5 +1,5 @@
 # =============================================================================
-# AQI TRAINING & FORECAST PIPELINE (Combined Script)
+# AQI TRAINING & FORECAST PIPELINE (Combined Script with Checkpointing)
 # =============================================================================
 import pandas as pd
 import numpy as np
@@ -20,12 +20,13 @@ import xgboost as xgb
 import lightgbm as lgb
 import catboost as cb
 
-# --- GLOBAL CONFIGURATION (Used by the Forecasting Part) ---
-# NOTE: This API_KEY is for OpenWeatherMap.
+# --- GLOBAL CONFIGURATION ---
 API_KEY = os.getenv("OWM_API_KEY") 
 LAT = 24.8607   # Karachi latitude
 LON = 67.0011   # Karachi longitude
-HISTORIC_PATH = "data/2years_features_clean.csv" # Adjusted path based on typical EDA output
+HISTORIC_PATH = "data/2years_features_clean.csv" 
+PERFORMANCE_FILE = "model_artifacts/best_model_performance.json"
+CHECKPOINT_MODEL_PATH = "model_artifacts/best_model.pkl"
 
 # =============================================================================
 # PART 1: MODEL TRAINING
@@ -57,7 +58,7 @@ def fetch_training_data():
         return df
     except Exception as e:
         print(f"Hopsworks failed: {e}")
-        # Fallback path updated to assume it's in the data directory
+        # Fallback path
         df = pd.read_csv(HISTORIC_PATH) 
         df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
         print(f"Fallback CSV: {df.shape}")
@@ -176,7 +177,6 @@ def train_with_cv(model, name, use_scaled=False):
     # Save this model
     model_path = f"model_artifacts/model_{name}.pkl"
     joblib.dump(final_model, model_path)
-    # print(f"Saved: {model_path}") # Removed for cleaner output
 
     # Store in dict
     models[name] = final_model
@@ -213,67 +213,118 @@ print("7. Linear")
 lr_model = LinearRegression()
 models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
 
+
 # ----------------------------------------------------------------------
-# 8. BEST MODEL
+# 8. BEST MODEL (WITH CHECKPOINT LOGIC)
 # ----------------------------------------------------------------------
 best_name = min(cv_scores, key=cv_scores.get)
 best_mod  = models[best_name]
 
 print("\n" + "="*80)
-print(f"BEST MODEL: {best_name.upper()} | CV MAE: {cv_scores[best_name]:.3f}")
+print(f"NEWLY TRAINED BEST MODEL: {best_name.upper()} | CV MAE: {cv_scores[best_name]:.3f}")
 print("="*80)
 
-# Save best model separately for inference
-best_model_path = f"model_artifacts/best_model_{best_name}.pkl"
-joblib.dump(best_mod, best_model_path)
-print(f"Best model also saved: {best_model_path}")
-
-# Final test prediction with best model
+# Final test prediction with new best model
 X_test_fin = X_test_scaled if best_name in ["ridge", "linear"] else X_test
 y_test_pred = best_mod.predict(X_test_fin)
-test_metrics = calc_metrics(y_test, y_test_pred, "FINAL TEST")
+new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW FINAL TEST")
+new_test_mae = new_test_metrics['mae']
+
+
+# --- CHECKPOINT LOGIC ---
+current_best_mae = float('inf')
+current_best_name = "N/A"
+
+# Load previous best performance
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            current_best_mae = prev_performance.get("test_mae", float('inf'))
+            current_best_name = prev_performance.get("model_name", "N/A")
+            print(f"Historical Best Test MAE: {current_best_mae:.3f} ({current_best_name})")
+    except Exception as e:
+        print(f"Error loading {PERFORMANCE_FILE}: {e}. Starting fresh checkpoint.")
+else:
+    print("No previous best model performance found. Saving current model.")
+
+
+# Compare and save/promote the model
+if new_test_mae < current_best_mae:
+    # A NEW BEST MODEL IS FOUND!
+    print("✅ New model is better! Saving as best_model.pkl and updating checkpoint.")
+    
+    # 1. Save the model as the new official 'best' checkpoint
+    joblib.dump(best_mod, CHECKPOINT_MODEL_PATH)
+    print(f"NEW BEST Model SAVED: {CHECKPOINT_MODEL_PATH}")
+    
+    # 2. Update the performance tracking file
+    performance_data = {
+        "model_name": best_name,
+        "test_mae": new_test_mae,
+        "test_r2": new_test_metrics['r2'],
+        "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+    with open(PERFORMANCE_FILE, "w") as f:
+        json.dump(performance_data, f, indent=2)
+
+    is_new_best = True
+    final_best_name = best_name
+    final_test_metrics = new_test_metrics
+else:
+    print(f"❌ New model (MAE {new_test_mae:.3f}) is not better than the historical best (MAE {current_best_mae:.3f}).")
+    print(f"Keeping the previously saved {CHECKPOINT_MODEL_PATH} checkpoint.")
+    
+    is_new_best = False
+    final_best_name = current_best_name
+    final_test_metrics = new_test_metrics # Use the new model's metrics for the current run summary
+    
+print("\n" + "="*80)
+print("CHECKPOINT COMPLETE")
+print("="*80)
+
 
 # ----------------------------------------------------------------------
 # 9. SAVE ALL METRICS & CONFIG
 # ----------------------------------------------------------------------
 joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
 
-with open("model_artifacts/metrics.json", "w") as f:
+# Save a comprehensive metrics file for the *current* run
+with open("model_artifacts/metrics_current_run.json", "w") as f:
     json.dump({
-        "best_model": best_name,
+        "trained_best_model": best_name,
+        "new_test_metrics": new_test_metrics,
         "cv_mae": cv_scores,
         "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
-        "best_test": test_metrics,
+        "historical_best_mae": current_best_mae,
+        "is_new_historical_best": is_new_best,
         "features": SELECTED_FEATURES,
         "scaler_needed": best_name in ["ridge", "linear"],
         "all_models_saved": [f"model_{name}.pkl" for name in models],
         "all_metrics": all_metrics
     }, f, indent=2)
 
-print(f"All metrics saved to model_artifacts/metrics.json")
+print(f"Current run metrics saved to model_artifacts/metrics_current_run.json")
 
 # ----------------------------------------------------------------------
 # 10. TRAINING FINAL SUMMARY
 # ----------------------------------------------------------------------
 print("\n" + "="*80)
-print("TRAINING COMPLETE – ALL MODELS SAVED")
+print("TRAINING COMPLETE – CHECKPOINT STATUS")
 print("="*80)
-print(f"Best Model      : {best_name.upper()}")
-print(f"CV MAE          : {cv_scores[best_name]:.3f}")
-print(f"Test MAE        : {test_metrics['mae']:.3f}")
-print(f"Test R²         : {test_metrics['r2']:.3f}")
-print(f"Gap (CV→Test)   : {test_metrics['mae'] - cv_scores[best_name]:.3f}")
-print(f"All Models      : model_artifacts/model_*.pkl")
-print(f"Best Model      : {best_model_path}")
+print(f"Best Model from Current Run : {best_name.upper()}")
+print(f"Current Run Test MAE        : {new_test_metrics['mae']:.3f}")
+print(f"Historical Best Test MAE    : {current_best_mae:.3f} ({current_best_name})")
+print(f"STATUS                      : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
+print(f"Saved Checkpoint Location   : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
 
 # =============================================================================
 # PART 2: FORECASTING
 # =============================================================================
-# This part runs immediately after training, using the artifacts just saved.
 
 # ----------------------------------------------------------------------
-# 0. CONFIG (MODIFIED: Use existing objects)
+# 0. CONFIG 
 # ----------------------------------------------------------------------
 MODEL_PATHS = {
     "xgboost":   "model_artifacts/model_xgboost.pkl",
@@ -285,34 +336,34 @@ MODEL_PATHS = {
     "linear":    "model_artifacts/model_linear.pkl"
 }
 
-# The objects (scaler, models, SELECTED_FEATURES) are already in memory 
-# from the training part, but reloading is safer for a standalone script,
-# so we'll re-load them from disk as per your original design.
-# This section assumes Part 1 has run and created the artifacts.
+# Add the historically best checkpoint model to the prediction list
+MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH 
+
 
 print("\n" + "#"*80)
 print("PART 2: 96-HOUR AQI FORECAST")
 print("#"*80)
 
-# Load scaler & features (Redundant but ensures continuity if run standalone)
-# scaler = joblib.load("model_artifacts/scaler.pkl")
-# SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
+# Load scaler & features (Keep loading from disk)
+scaler = joblib.load("model_artifacts/scaler.pkl")
+SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
 
 # Load models
-# The 'models' dictionary is already populated from Part 1, but we use the
-# MODEL_PATHS dictionary for consistency with the original script structure.
 models = {}
 for name, path in MODEL_PATHS.items():
     try:
+        # Skip the checkpoint if it wasn't created on the first run
+        if name == 'best_checkpoint' and not os.path.exists(path):
+             print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
+             continue
         models[name] = joblib.load(path)
-        # print(f"Loaded {name}")
     except Exception as e:
-        print(f"Failed to load {name}: {e}")
+        print(f"Failed to load {name} from {path}: {e}")
 
 print(f"Loaded {len(models)} models for prediction.")
 
 # ----------------------------------------------------------------------
-# 1. US-AQI CONVERSION (RE-DEFINED FOR CLARITY, SAME CODE)
+# 1. US-AQI CONVERSION (Same as Part 1)
 # ----------------------------------------------------------------------
 breakpoints = {
     'pm2_5': [(0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
@@ -384,7 +435,7 @@ df_forecast = get_pollution_forecast(LAT, LON, API_KEY)
 df_forecast['Actual_AQI'] = df_forecast.apply(calc_us_aqi, axis=1).round().astype(int).clip(0, 500)
 
 # ----------------------------------------------------------------------
-# 3. LOAD HISTORIC DATA (FIXED: ISO8601)
+# 3. LOAD HISTORIC DATA
 # ----------------------------------------------------------------------
 print(f"Loading historic data from {HISTORIC_PATH}...")
 df_hist = pd.read_csv(HISTORIC_PATH)
@@ -413,11 +464,9 @@ def build_features(df_fc, last_hist):
     df['pm10_rolling_3h']  = combined['pm10'].rolling(3, min_periods=1).mean().iloc[-96:].values
     df['co_rolling_3h']    = combined['co'].rolling(3, min_periods=1).mean().iloc[-96:].values
 
-    # Ensure 'us_aqi' is in last_hist for lag feature, fetch from df if not present
     if 'us_aqi' in last_hist.columns:
         df['us_aqi_lag1'] = last_hist['us_aqi'].iloc[-1]
     else:
-        # If 'us_aqi' column is not in the historic features file, this feature will be missing
         df['us_aqi_lag1'] = 0 
         
     df = df.drop(columns=['hour', 'month'], errors='ignore')
@@ -433,25 +482,48 @@ predictions = {'datetime': df_fc_feat['datetime_utc'], 'Actual_AQI': df_fc_feat[
 model_names = list(models.keys())
 
 for name in model_names:
-    # print(f"Predicting with {name}...") # Removed for cleaner output
     model = models[name]
-    if name in ["ridge", "linear"]:
+    if name in ["ridge", "linear", "best_checkpoint"] and hasattr(model, 'alpha'): # Check for linear models which use scaler
+        X_input = scaler.transform(X)
+    elif name == "best_checkpoint": # Handle scaled case for checkpoint model
+         # Need to check the historical config if the checkpoint is a scaled model
+         # For simplicity, we assume the best_name from training is used to determine scaling
+         if current_best_name in ["ridge", "linear"]:
+             X_input = scaler.transform(X)
+         else:
+             X_input = X
+    else:
+        X_input = X
+        
+    # Re-apply model-specific scaling check for the best_checkpoint
+    if name == "best_checkpoint" and current_best_name in ["ridge", "linear"]:
+        X_input = scaler.transform(X)
+    elif name == "best_checkpoint" and current_best_name not in ["ridge", "linear"]:
+        X_input = X
+    elif name in ["ridge", "linear"]:
         X_input = scaler.transform(X)
     else:
         X_input = X
+
+
     pred = model.predict(X_input)
     pred = np.clip(pred.round().astype(int), 0, 500)
     predictions[name] = pred
 
-# Closest Model
-abs_errors = np.abs(np.array([predictions[m] for m in model_names]) - predictions['Actual_AQI'].values)
+# Closest Model (Only compare the 7 trained models + checkpoint for error)
+model_names_for_error = [name for name in model_names if name != 'best_checkpoint']
+abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - predictions['Actual_AQI'].values)
 closest_idx = np.argmin(abs_errors, axis=0)
-predictions['Closest_Model'] = [model_names[i] for i in closest_idx]
+predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
 
 # ----------------------------------------------------------------------
 # 6. SAVE future_aqi_predictions.csv (EXACT COLUMNS)
 # ----------------------------------------------------------------------
-cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear', 'Closest_Model']
+cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear']
+if 'best_checkpoint' in predictions:
+    cols.append('best_checkpoint')
+cols.append('Closest_Model')
+
 df_pred = pd.DataFrame(predictions)[cols]
 df_pred.to_csv("future_aqi_predictions.csv", index=False)
 print("Saved: future_aqi_predictions.csv")
@@ -462,12 +534,11 @@ print("Saved: future_aqi_predictions.csv")
 y_true = df_pred['Actual_AQI'].values
 metrics_list = []
 
-for name in model_names:
+for name in [n for n in model_names if n in df_pred.columns]:
     y_pred = df_pred[name].values
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
-    # Handle division by zero for MAPE gracefully by adding 1e-6
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100 
     metrics_list.append({
         "Model": name,
@@ -485,19 +556,24 @@ print("\n" + df_metrics.to_string(index=False))
 # ----------------------------------------------------------------------
 # 8. PLOT — 7 INDIVIDUAL GRAPHS (One per Model)
 # ----------------------------------------------------------------------
-print("Generating 7 individual model comparison plots...")
+print("Generating model comparison plots...")
 
 os.makedirs("model_comparison_plots", exist_ok=True)
 
 actual = df_pred['Actual_AQI'].values
 dates = df_pred['datetime']
 
-for name in model_names:
+for name in [n for n in model_names if n in df_pred.columns]:
     pred = df_pred[name].values
     
     plt.figure(figsize=(14, 6))
     plt.plot(dates, actual, label='Actual AQI (OWM)', color='black', linewidth=2.5, marker='o', markersize=3)
-    plt.plot(dates, pred, label=f'{name.upper()} Prediction', color='teal', linewidth=2.5, alpha=0.9)
+    
+    color = 'teal'
+    if name == 'best_checkpoint':
+        color = 'red'
+        
+    plt.plot(dates, pred, label=f'{name.upper()} Prediction', color=color, linewidth=2.5, alpha=0.9)
     plt.fill_between(dates, actual, pred, color='lightgray', alpha=0.5, label='Error Band')
     
     plt.title(f'96-Hour AQI Forecast: Actual vs {name.upper()}', fontsize=15, fontweight='bold')
@@ -510,8 +586,8 @@ for name in model_names:
     
     safe_name = name.replace(" ", "_")
     plt.savefig(f"model_comparison_plots/{safe_name}_vs_actual.png", dpi=200, bbox_inches='tight')
-    # plt.show() # Commented out as GitHub Actions run on servers without display
+    # plt.show()
     plt.close()
 
-print("7 individual plots saved in: model_comparison_plots/")
+print(f"{len([n for n in model_names if n in df_pred.columns])} plots saved in: model_comparison_plots/")
 print("\nAll done!")
