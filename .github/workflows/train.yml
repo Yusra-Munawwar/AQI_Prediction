@@ -30,18 +30,15 @@ jobs:
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
-        run: python scripts/training.py
+        # Assuming your script is named train.py in the root. Adjust the path if needed (e.g., scripts/train.py)
+        run: python train.py 
 
       - name: Debug - List Generated Files
         run: |
-          echo "=== Files in root ==="
-          ls -la *.pkl *.pth *.npy *.json 2>/dev/null || echo "No model files in root"
-          echo "=== Files in data/ ==="
-          ls -la data/ 2>/dev/null || echo "No data directory"
-          echo "=== Files in checkpoints/ ==="
-          ls -la checkpoints/ 2>/dev/null || echo "No checkpoints directory"
-          echo "=== Files in best_models/ ==="
-          ls -la best_models/ 2>/dev/null || echo "No best_models directory"
+          echo "=== Files in model_artifacts/ ==="
+          ls -la model_artifacts/ 2>/dev/null || echo "No model_artifacts directory"
+          echo "=== Files in model_comparison_plots/ ==="
+          ls -la model_comparison_plots/ 2>/dev/null || echo "No plots directory"
 
       - name: Commit Updated Files
         run: |
@@ -50,16 +47,15 @@ jobs:
 
           TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
 
-          # Stage all expected files
-          git add data/training_results.csv || echo "training_results.csv not found"
-          git add data/future_aqi_predictions.csv || echo "future_aqi_predictions.csv not found"
-          git add data/future_prediction_comparison.csv || echo "future_prediction_comparison.csv not found"
+          # 1. Stage CSV results from the root directory
+          git add future_aqi_predictions.csv || echo "future_aqi_predictions.csv not found"
+          git add future_prediction_comparison.csv || echo "future_prediction_comparison.csv not found"
 
-          git add linear_model.pkl poly_coeffs.npy linear_model.pth mlp_model.pth \
-                  gb_model.pkl xgb_model.json rf_model.pkl scaler.pkl selected_features.json \
-                  previous_best_results.csv || true
+          # 2. Stage all model artifacts and checkpoint files
+          # Note: The 'git add' commands below will add the entire directory
+          git add model_artifacts/ || echo "model_artifacts/ not found"
+          git add model_comparison_plots/ || echo "model_comparison_plots/ not found"
 
-          git add checkpoints/ best_models/ || true
 
           echo "=== Staged files ==="
           git status --short
@@ -67,7 +63,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update training results and forecasts [$TIMESTAMP]"
+            git commit -m "Update AQI training, checkpoint, and forecast results [$TIMESTAMP]"
 
             # PULL FIRST (with rebase) → THEN PUSH
             git pull --rebase origin main || git pull --rebase origin main
@@ -76,28 +72,12 @@ jobs:
             echo "Successfully committed and pushed changes"
           fi
 
-      - name: Upload Models
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: trained-models
+          name: aqi-pipeline-artifacts
           path: |
-            linear_model.pkl
-            poly_coeffs.npy
-            linear_model.pth
-            mlp_model.pth
-            gb_model.pkl
-            xgb_model.json
-            rf_model.pkl
-            scaler.pkl
-            selected_features.json
-            checkpoints/
-            best_models/
-
-      - name: Upload Results Data
-        uses: actions/upload-artifact@v4
-        with:
-          name: training-results
-          path: |
-            data/training_results.csv
-            data/future_aqi_predictions.csv
-            data/future_prediction_comparison.csv
+            model_artifacts/
+            model_comparison_plots/
+            future_aqi_predictions.csv
+            future_prediction_comparison.csv
