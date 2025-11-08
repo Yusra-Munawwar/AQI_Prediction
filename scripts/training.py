@@ -217,61 +217,56 @@ models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
 # ----------------------------------------------------------------------
 # 8. BEST MODEL (WITH CHECKPOINT LOGIC)
 # ----------------------------------------------------------------------
-best_name = min(cv_scores, key=cv_scores.get)
-best_mod  = models[best_name]
+
+# 1. IDENTIFY CURRENT RUN'S BEST MODEL BASED ON CV MAE
+best_name_cv = min(cv_scores, key=cv_scores.get)
+best_mod_cv = models[best_name_cv]
+new_cv_mae = cv_scores[best_name_cv]
+is_new_best = False # Default status
 
 print("\n" + "="*80)
-print(f"NEWLY TRAINED BEST MODEL: {best_name.upper()} | CV MAE: {cv_scores[best_name]:.3f}")
+print(f"CURRENT RUN BEST (CV): {best_name_cv.upper()} | CV MAE: {new_cv_mae:.3f}")
 print("="*80)
 
-# Final test prediction with new best model
-X_test_fin = X_test_scaled if best_name in ["ridge", "linear"] else X_test
-y_test_pred = best_mod.predict(X_test_fin)
-new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW FINAL TEST")
+# Final test prediction for the CV-selected model (for logging purposes)
+X_test_fin = X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test
+y_test_pred = best_mod_cv.predict(X_test_fin)
+new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW TEST METRICS")
 new_test_mae = new_test_metrics['mae']
 
 
-# --- CHECKPOINT LOGIC ---
-current_best_mae = float('inf')
-current_best_name = "N/A"
+# --- CHECKPOINT LOGIC (PRIORITIZING CV MAE) ---
+historical_best_cv_mae = float('inf')
+historical_best_name = "N/A"
 
-# Load previous best performance
+# Load previous best performance from the JSON file
 if os.path.exists(PERFORMANCE_FILE):
     try:
         with open(PERFORMANCE_FILE, "r") as f:
             prev_performance = json.load(f)
-            current_best_mae = prev_performance.get("test_mae", float('inf'))
-            current_best_name = prev_performance.get("model_name", "N/A")
-            print(f"Historical Best Test MAE: {current_best_mae:.3f} ({current_best_name})")
+            # IMPORTANT: Load the historical CV MAE for comparison
+            historical_best_cv_mae = prev_performance.get("cv_mae", float('inf')) 
+            historical_best_name = prev_performance.get("model_name", "N/A")
+            print(f"Historical Best CV MAE: {historical_best_cv_mae:.3f} ({historical_best_name})")
     except Exception as e:
         print(f"Error loading {PERFORMANCE_FILE}: {e}. Starting fresh checkpoint.")
 else:
-    print("No previous best model performance found. Saving current model.")
+    print("No previous best model performance found. Saving current CV best model.")
 
-
-# Compare and save/promote the model
-# Use the best model found by CV for the current run
-best_name_cv = min(cv_scores, key=cv_scores.get)
-new_cv_mae = cv_scores[best_name_cv]
-
-# --- CHECKPOINT LOGIC ---
-current_best_cv_mae = float('inf')
-# Load historical best CV MAE from PERFORMANCE_FILE
-
-# Compare the CURRENT RUN's BEST CV MAE against the HISTORICAL BEST CV MAE
-if new_cv_mae < current_best_cv_mae:
-    # ... save and promote model (using the model determined by CV) ...
-    # Be sure to update the PERFORMANCE_FILE to save the new CV MAE    # A NEW BEST MODEL IS FOUND!
-    print("✅ New model is better! Saving as best_model.pkl and updating checkpoint.")
+# 2. COMPARE AND SAVE/PROMOTE THE MODEL
+if new_cv_mae < historical_best_cv_mae:
+    # A NEW, MORE ROBUST MODEL IS FOUND!
+    print(f"✅ New model ({best_name_cv.upper()}) is more robust (CV MAE {new_cv_mae:.3f} < {historical_best_cv_mae:.3f}). Saving checkpoint.")
     
     # 1. Save the model as the new official 'best' checkpoint
-    joblib.dump(best_mod, CHECKPOINT_MODEL_PATH)
+    joblib.dump(best_mod_cv, CHECKPOINT_MODEL_PATH)
     print(f"NEW BEST Model SAVED: {CHECKPOINT_MODEL_PATH}")
     
-    # 2. Update the performance tracking file
+    # 2. Update the performance tracking file with the new CV metrics
     performance_data = {
-        "model_name": best_name,
-        "test_mae": new_test_mae,
+        "model_name": best_name_cv,
+        "cv_mae": new_cv_mae, # Now tracking CV MAE
+        "test_mae": new_test_mae, # Keep test MAE for reference
         "test_r2": new_test_metrics['r2'],
         "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
     }
@@ -279,20 +274,20 @@ if new_cv_mae < current_best_cv_mae:
         json.dump(performance_data, f, indent=2)
 
     is_new_best = True
-    final_best_name = best_name
+    final_best_name = best_name_cv
     final_test_metrics = new_test_metrics
 else:
-    print(f"❌ New model (MAE {new_test_mae:.3f}) is not better than the historical best (MAE {current_best_mae:.3f}).")
+    print(f"❌ Current CV best ({best_name_cv.upper()} MAE {new_cv_mae:.3f}) is not better than the historical best (MAE {historical_best_cv_mae:.3f}).")
     print(f"Keeping the previously saved {CHECKPOINT_MODEL_PATH} checkpoint.")
     
     is_new_best = False
-    final_best_name = current_best_name
-    final_test_metrics = new_test_metrics # Use the new model's metrics for the current run summary
+    # Use the historical name/metrics for the final summary if we kept the old model
+    final_best_name = historical_best_name 
+    final_test_metrics = new_test_metrics # Use the current run's metrics for the current run summary
     
 print("\n" + "="*80)
 print("CHECKPOINT COMPLETE")
 print("="*80)
-
 
 # ----------------------------------------------------------------------
 # 9. SAVE ALL METRICS & CONFIG
