@@ -43,12 +43,12 @@ jobs:
         
     - name: Commit artifacts
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add data/
-        git diff --quiet && git diff --staged --quiet || git commit -m "Update EDA artifacts - $(date +'%Y-%m-%d %H:%M:%S')"
-        git pull --rebase origin main
-        git push
+       git config --local user.email "action@github.com"
+       git config --local user.name "GitHub Action"
+       git add data/ plots/ 
+       git diff --quiet && git diff --staged --quiet || git commit -m "Update EDA artifacts - $(date +'%Y-%m-%d %H:%M:%S')"
+       git pull --rebase origin main
+       git push
         
     - name: Trigger training workflow
       if: success()
