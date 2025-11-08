@@ -317,6 +317,25 @@ if HOPSWORKS_AVAILABLE:
             issues_fixed.append("Filled NaN values (0 for numeric, 'unknown' for others)")
 
         # 6. Numeric to float64/int64 and handle inf
+        # In eda.py -> validate_dataframe_for_hopsworks
+
+        # 6. Numeric to float64/int64 and handle inf
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+    
+            # 🎯 FIX: EXCLUDE datetime_utc from float64 conversion
+            if col == 'datetime_utc':
+                # Ensure it remains a standard 64-bit integer (bigint)
+                df_clean[col] = df_clean[col].astype('int64')
+                continue # Skip the rest of the generic numeric checks for this column
+        
+            inf_count = np.isinf(df_clean[col]).sum()
+            # ... (rest of the infinity handling remains the same)
+    
+            # Coerce to float64 (safe for all other numerics)
+            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').astype('float64')
+
+# ... (rest of the function)
         numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             inf_count = np.isinf(df_clean[col]).sum()
