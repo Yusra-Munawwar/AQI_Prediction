@@ -179,29 +179,33 @@ if view_mode == "Historical Data":
     # Pollutant breakdown - Simplified
     st.subheader("🧪 Pollutant Concentrations (Last 30 Days)")
     
-    pollutant_cols = ['pm2_5', 'pm10', 'co', 'no2', 'so2', 'o3']
+    # --- CRITICAL FIX: Dynamically determine which pollutants exist ---
+    EXPECTED_POLLUTANTS = ['pm2_5', 'pm10', 'co', 'no2', 'so2', 'o3']
+    pollutant_cols = [p for p in EXPECTED_POLLUTANTS if p in filtered_data.columns]
     
-    fig_pollutant = go.Figure()
-    
-    colors = px.colors.qualitative.Bold
-    
-    for i, p in enumerate(pollutant_cols):
-        fig_pollutant.add_trace(go.Scatter(
-            x=filtered_data['datetime_utc'],
-            y=filtered_data[p],
-            mode='lines',
-            name=p.upper(),
-            line=dict(color=colors[i % len(colors)], width=1.5)
-        ))
+    if not pollutant_cols:
+        st.warning("⚠️ Could not find any of the standard raw pollutant columns (pm2_5, o3, etc.) in the historical data file.")
+    else:
+        fig_pollutant = go.Figure()
+        colors = px.colors.qualitative.Bold
+        
+        for i, p in enumerate(pollutant_cols):
+            fig_pollutant.add_trace(go.Scatter(
+                x=filtered_data['datetime_utc'],
+                y=filtered_data[p], 
+                mode='lines',
+                name=p.upper(),
+                line=dict(color=colors[i % len(colors)], width=1.5)
+            ))
 
-    fig_pollutant.update_layout(
-        title="Key Pollutant Concentrations",
-        xaxis_title="Date", 
-        yaxis_title="Concentration (units vary)", 
-        hovermode='x unified',
-        height=400
-    )
-    st.plotly_chart(fig_pollutant, use_container_width=True)
+        fig_pollutant.update_layout(
+            title="Key Pollutant Concentrations",
+            xaxis_title="Date", 
+            yaxis_title="Concentration (units vary)", 
+            hovermode='x unified',
+            height=400
+        )
+        st.plotly_chart(fig_pollutant, use_container_width=True)
 
 # ============================================================================
 # FUTURE PREDICTIONS VIEW
@@ -228,7 +232,7 @@ elif view_mode == "Future Predictions":
     col1, col2 = st.columns(2)
     with col1:
         avg_pred = predictions[selected_model].mean()
-        st.metric(f"Average Predicted AQI ({selected_model})", f"{avg_pred:.1f}")
+        st.metric(f"Average Predicted AQI ({selected_model.upper()})", f"{avg_pred:.1f}")
     with col2:
         max_pred = predictions[selected_model].max()
         st.metric("Maximum Predicted AQI", f"{max_pred:.0f}")
