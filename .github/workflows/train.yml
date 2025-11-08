@@ -39,6 +39,43 @@ jobs:
           ls -la model_artifacts/ 2>/dev/null || echo "No model_artifacts directory"
           echo "=== Files in model_comparison_plots/ ==="
           ls -la model_comparison_plots/ 2>/dev/null || echo "No plots directory"
+     - name: Commit Updated Files
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
+
+          # 🚨 CRITICAL FIX: Stage ALL files (Modified, Deleted, and NEW Untracked) 
+          # This catches any residual or hidden output files that CatBoost or 
+          # other libraries might create in the working directory (like logs).
+          git add -A
+          
+          echo "=== Staged files ==="
+          git status --short
+
+          # We are checking for changes *after* git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update AQI training, checkpoint, and forecast results [$TIMESTAMP]"
+
+            # PULL FIRST (with rebase) → THEN PUSH
+            # We use a short retry loop in case of transient push errors
+            for i in 1 2; do
+              # The '|| true' is important here to ensure the action doesn't fail 
+              # if the branch is already clean or if the initial pull fails.
+              git pull --rebase origin main || true 
+              
+              if git push origin HEAD:main; then
+                echo "Successfully committed and pushed changes on attempt $i"
+                break
+              else
+                echo "Push failed on attempt $i, retrying..."
+                sleep 5
+              fi
+            done
+          fi
 
       - name: Commit Updated Files
         run: |
@@ -47,30 +84,37 @@ jobs:
 
           TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
 
-          # 1. Stage CSV results from the root directory
-          git add future_aqi_predictions.csv || echo "future_aqi_predictions.csv not found"
-          git add future_prediction_comparison.csv || echo "future_prediction_comparison.csv not found"
-
-          # 2. Stage all model artifacts and checkpoint files
-          # Note: The 'git add' commands below will add the entire directory
-          git add model_artifacts/ || echo "model_artifacts/ not found"
-          git add model_comparison_plots/ || echo "model_comparison_plots/ not found"
-
-
+          # 🚨 CRITICAL FIX: Stage ALL files (Modified, Deleted, and NEW Untracked) 
+          # This catches any residual or hidden output files that CatBoost or 
+          # other libraries might create in the working directory (like logs).
+          git add -A
+          
           echo "=== Staged files ==="
           git status --short
 
+          # We are checking for changes *after* git add -A
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
             git commit -m "Update AQI training, checkpoint, and forecast results [$TIMESTAMP]"
 
             # PULL FIRST (with rebase) → THEN PUSH
-            git pull --rebase origin main || git pull --rebase origin main
-            git push origin HEAD:main
-
-            echo "Successfully committed and pushed changes"
+            # We use a short retry loop in case of transient push errors
+            for i in 1 2; do
+              # The '|| true' is important here to ensure the action doesn't fail 
+              # if the branch is already clean or if the initial pull fails.
+              git pull --rebase origin main || true 
+              
+              if git push origin HEAD:main; then
+                echo "Successfully committed and pushed changes on attempt $i"
+                break
+              else
+                echo "Push failed on attempt $i, retrying..."
+                sleep 5
+              fi
+            done
           fi
+      
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
