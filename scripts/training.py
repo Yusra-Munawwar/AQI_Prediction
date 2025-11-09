@@ -560,31 +560,39 @@ for name in model_names:
     try:
         if name == "xgboost":
             # Convert to DMatrix with feature names
-            dmat = DMatrix(X_df, feature_names=SELECTED_FEATURES)
+            dmat = DMatrix(X, feature_names=SELECTED_FEATURES)
             pred = model.predict(dmat)
+        elif name == "best_checkpoint":
+            # Handle checkpoint model based on its type
+            if current_checkpoint_name == "xgboost":
+                dmat = DMatrix(X, feature_names=SELECTED_FEATURES)
+                pred = model.predict(dmat)
+            elif current_checkpoint_name in ["ridge", "linear"]:
+                X_input = scaler.transform(X)
+                pred = model.predict(X_input)
+            elif current_checkpoint_name in ["lightgbm", "catboost"]:
+                pred = model.predict(X_df)
+            else:
+                # RF, GB - use numpy array
+                pred = model.predict(X)
         elif name in ["lightgbm", "catboost"]:
             # Use DataFrame to keep feature names
             pred = model.predict(X_df)
         elif name in ["ridge", "linear"]:
-            # Scale for linear models
-            pred = model.predict(scaler.transform(X_df))
-        elif name == "best_checkpoint" and current_checkpoint_name in ["ridge", "linear"]:
-            # Handle checkpoint model if it's linear
-            pred = model.predict(scaler.transform(X_df))
-        elif name == "best_checkpoint" and current_checkpoint_name == "xgboost":
-            # Handle checkpoint model if it's XGBoost
-            dmat = DMatrix(X_df, feature_names=SELECTED_FEATURES)
-            pred = model.predict(dmat)
+            # Scale for linear models - use numpy array
+            X_input = scaler.transform(X)
+            pred = model.predict(X_input)
         else:
-            # Tree ensembles (RF, GB) or checkpoint
-            pred = model.predict(X_df)
+            # Tree ensembles (RF, GB) - use numpy array
+            pred = model.predict(X)
 
         # Clip predictions
         pred = np.clip(np.round(pred).astype(int), 0, 500)
         predictions[name] = pred
     except Exception as e:
         print(f"Prediction error for {name}: {e}")
-        predictions[name] = np.full(len(X_df), np.nan)
+        # Use zeros instead of NaN to avoid downstream errors
+        predictions[name] = np.zeros(len(X), dtype=int)
 
 # Closest Model
 model_names_for_error = [name for name in model_names if name != 'best_checkpoint']
@@ -617,22 +625,31 @@ if os.path.exists(PERFORMANCE_FILE):
 
 for name in [n for n in model_names if n in df_pred.columns]:
     y_pred = df_pred[name].values
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100
-   
-    display_name = name
-    if name == 'best_checkpoint':
-        display_name = f"best_checkpoint ({checkpoint_name_in_file})"
+    
+    # Check if predictions are valid
+    if np.all(y_pred == 0):
+        print(f"Warning: {name} predictions are all zeros (likely failed). Skipping metrics.")
+        continue
+    
+    try:
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        r2 = r2_score(y_true, y_pred)
+        mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100
        
-    metrics_list.append({
-        "Model": display_name,
-        "MAE": round(mae, 3),
-        "RMSE": round(rmse, 3),
-        "R²": round(r2, 3),
-        "MAPE": round(mape, 2)
-    })
+        display_name = name
+        if name == 'best_checkpoint':
+            display_name = f"best_checkpoint ({checkpoint_name_in_file})"
+           
+        metrics_list.append({
+            "Model": display_name,
+            "MAE": round(mae, 3),
+            "RMSE": round(rmse, 3),
+            "R²": round(r2, 3),
+            "MAPE": round(mape, 2)
+        })
+    except Exception as e:
+        print(f"Error calculating metrics for {name}: {e}")
 
 df_metrics = pd.DataFrame(metrics_list)
 df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
