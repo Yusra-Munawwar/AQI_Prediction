@@ -5,18 +5,15 @@ import plotly.express as px
 from datetime import datetime
 import os
 
-# Page config
 st.set_page_config(
     page_title="AQI Prediction Dashboard",
     page_icon="🌫️",
     layout="wide"
 )
 
-# Title
 st.title("🌫️ Air Quality Index (AQI) Prediction Dashboard")
 st.markdown("### Karachi Air Quality Monitoring & Forecasting (ML Pipeline Results)")
 
-# Define AQI categories and colors
 AQI_CATEGORIES = {
     (0, 50): ('Good', '#00E400'),
     (51, 100): ('Moderate', '#FFFF00'),
@@ -31,10 +28,8 @@ def get_aqi_color(aqi):
     for (low, high), (category, color) in AQI_CATEGORIES.items():
         if low <= aqi <= high:
             return color, category
-    # Handle values > 500
     return '#7E0023', 'Hazardous'
 
-# Load data
 @st.cache_data
 def load_data():
     historical_df = None
@@ -73,12 +68,11 @@ def load_data():
 
 historical, predictions, comparison = load_data()
 
-# Check for essential data availability
 if historical is None or historical.empty:
     st.info("Waiting for historical data load to proceed...")
     st.stop() 
 
-# --- KEY PERFORMANCE INDICATORS (ALWAYS DISPLAYED) ---
+#  KEY PERFORMANCE INDICATORS  
 if not historical.empty:
     current_aqi = historical['us_aqi'].iloc[-1]
     color, category = get_aqi_color(current_aqi)
@@ -109,21 +103,17 @@ if not historical.empty:
         forecast_hours = len(predictions) if predictions is not None and not predictions.empty else "N/A"
         st.metric("Forecast Horizon", f"{forecast_hours} Hours")
     
-    st.markdown("---") # Separator after KPIs
+    st.markdown("---") 
 
-# Sidebar
 st.sidebar.header("⚙️ Configuration")
 view_mode = st.sidebar.radio("Select View", ["Future Predictions", "Historical Data", "Forecast Comparison"])
 st.sidebar.markdown("---")
 st.sidebar.info("The prediction models run hourly to provide the latest 96-hour forecast.")
 
-# ============================================================================
 # HISTORICAL DATA VIEW
-# ============================================================================
 if view_mode == "Historical Data":
     st.header("📊 Historical Air Quality Data")
     
-    # Historical Key metrics (excluding current AQI, which is now always visible)
     col2, col3, col4 = st.columns(3)
     with col2:
         avg_aqi = historical['us_aqi'].mean()
@@ -134,10 +124,8 @@ if view_mode == "Historical Data":
     with col4:
         st.metric("Total Records", f"{len(historical):,}")
     
-    # Time series plot
     st.subheader("🕒 AQI Over Time")
     
-    # Date range selector (using latest 30 days as default)
     default_start = historical['datetime_utc'].max() - pd.Timedelta(days=30)
     
     date_range = st.date_input(
@@ -162,7 +150,6 @@ if view_mode == "Historical Data":
             fillcolor='rgba(52, 152, 219, 0.2)'
         ))
         
-        # Add AQI category bands
         for (low, high), (category, color) in AQI_CATEGORIES.items():
             fig.add_hrect(y0=low, y1=high, fillcolor=color, opacity=0.1, line_width=0, annotation_text=category, annotation_position="top left")
 
@@ -176,19 +163,15 @@ if view_mode == "Historical Data":
         )
         st.plotly_chart(fig, use_container_width=True)
     
-    # Pollutant breakdown - Simplified
     st.subheader("🧪 Pollutant Concentrations (Last 30 Days)")
     
-    # --- CRITICAL FIX: Dynamically determine which pollutants exist ---
     EXPECTED_POLLUTANTS = ['pm2_5', 'pm10', 'co', 'no2', 'so2', 'o3']
     pollutant_cols = [p for p in EXPECTED_POLLUTANTS if p in filtered_data.columns]
     
     if not pollutant_cols:
         st.warning("⚠️ Could not find any of the standard raw pollutant columns (pm2_5, o3, etc.) in the historical data file.")
     else:
-        # 🎯 START OF MODIFICATION: Create separate small graphs for each pollutant
         
-        # Determine number of columns for display
         num_cols = 3
         cols = st.columns(num_cols)
         
@@ -214,18 +197,13 @@ if view_mode == "Historical Data":
                     yaxis_title="Concentration", 
                     hovermode='x unified',
                     height=250, # Keep graphs small
-                    margin=dict(l=10, r=10, t=40, b=10) # Adjust margins
+                    margin=dict(l=10, r=10, t=40, b=10) 
                 )
-                # Hide x-axis ticks for cleaner look, only keep the labels
                 fig_pollutant.update_xaxes(showticklabels=True) 
                 
                 st.plotly_chart(fig_pollutant, use_container_width=True)
-        # 🎯 END OF MODIFICATION
 
-
-# ============================================================================
 # FUTURE PREDICTIONS VIEW
-# ============================================================================
 elif view_mode == "Future Predictions":
     st.header("🔮 96-Hour AQI Forecast")
     
@@ -233,19 +211,15 @@ elif view_mode == "Future Predictions":
         st.error("Forecast data is not available. Please run the training script to generate predictions.")
         st.stop()
 
-    # Determine available models dynamically
-    # 🎯 MODIFICATION: Exclude the new 'Checkpoint_Model_Name' from model selection list
     EXCLUDED_COLS = ['datetime_utc', 'Actual_AQI', 'Closest_Model', 'Checkpoint_Model_Name'] 
     available_models = [col for col in predictions.columns if col not in EXCLUDED_COLS]
     
-    # Prioritize the best checkpoint model if available
     default_model_index = 0
     if 'best_checkpoint' in available_models:
         default_model_index = available_models.index('best_checkpoint')
         
     selected_model = st.sidebar.selectbox("Select Model for Detailed View", available_models, index=default_model_index)
     
-    # Key metrics for prediction
     col1, col2 = st.columns(2)
     with col1:
         avg_pred = predictions[selected_model].mean()
@@ -254,12 +228,10 @@ elif view_mode == "Future Predictions":
         max_pred = predictions[selected_model].max()
         st.metric("Maximum Predicted AQI", f"{max_pred:.0f}")
     
-    # Prediction comparison plot
     st.subheader(f"📊 {selected_model.upper()} Forecast vs OWM Actual AQI")
     
     fig_pred = go.Figure()
     
-    # OWM Actual AQI (used as the current 'truth' for the next 96 hours)
     fig_pred.add_trace(go.Scatter(
         x=predictions['datetime_utc'],
         y=predictions['Actual_AQI'],
@@ -268,7 +240,6 @@ elif view_mode == "Future Predictions":
         line=dict(color='#2ECC71', width=3, dash='dot')
     ))
     
-    # Predicted AQI
     fig_pred.add_trace(go.Scatter(
         x=predictions['datetime_utc'],
         y=predictions[selected_model],
@@ -278,7 +249,7 @@ elif view_mode == "Future Predictions":
         marker=dict(size=4)
     ))
     
-    # Add AQI category bands
+    
     for (low, high), (category, color) in AQI_CATEGORIES.items():
         fig_pred.add_hrect(y0=low, y1=high, fillcolor=color, opacity=0.1, line_width=0)
         
@@ -292,21 +263,16 @@ elif view_mode == "Future Predictions":
     st.plotly_chart(fig_pred, use_container_width=True)
     
     
-    # Prediction table
     st.subheader("📋 Detailed Hourly Predictions (All Columns)") # 🎯 MODIFICATION: Title change
     
-    # 🎯 START OF MODIFICATION: Display all columns
     display_df = predictions.copy()
 
-    # 1. Format the date column
     display_df['datetime_utc'] = display_df['datetime_utc'].dt.strftime('%Y-%m-%d %H:%M')
 
-    # 2. Add the selected model's error column 
     if selected_model in display_df.columns:
         try:
             display_df[f'{selected_model} Error'] = abs(display_df['Actual_AQI'] - display_df[selected_model]).round(1)
             
-            # Dynamically determine all model columns and format them as integers
             all_model_cols = [col for col in predictions.columns if col not in ['datetime_utc', 'Actual_AQI', 'Closest_Model', 'Checkpoint_Model_Name']]
             
             format_cols = {col: '{:.0f}' for col in all_model_cols if col in display_df.columns}
@@ -319,22 +285,17 @@ elif view_mode == "Future Predictions":
             highlight_cols = []
             format_cols = {}
 
-        # 3. Display the DataFrame
         st.dataframe(
             display_df.style
-            .highlight_max(subset=highlight_cols, color='#FFDBDB') # Highlight max error
+            .highlight_max(subset=highlight_cols, color='#FFDBDB') 
             .format(format_cols),
             use_container_width=True, 
             height=400
         )
     else:
         st.warning(f"Model column '{selected_model}' not found in predictions data.")
-    # 🎯 END OF MODIFICATION
 
 
-# ============================================================================
-# FORECAST COMPARISON VIEW
-# ============================================================================
 else:
     st.header("🤖 Forecast Performance Comparison")
     
@@ -342,7 +303,6 @@ else:
         st.error("Comparison metrics are not available. Please run the training script to generate metrics.")
         st.stop()
         
-    # Extract best models based on MAE (lower is better)
     best_forecast_model = comparison.loc[comparison['MAE'].idxmin(), 'Model']
     best_mae = comparison['MAE'].min()
     
@@ -351,7 +311,6 @@ else:
     col1, col2 = st.columns(2)
     
     with col1:
-        # Forecast MAE
         fig_mae = px.bar(comparison.sort_values('MAE'), x='Model', y='MAE', 
                          title='Mean Absolute Error (Lower is Better)', color='MAE',
                          color_continuous_scale='Reds',
@@ -361,7 +320,6 @@ else:
         st.plotly_chart(fig_mae, use_container_width=True)
     
     with col2:
-        # Forecast R²
         fig_r2_fut = px.bar(comparison.sort_values('R²', ascending=False), x='Model', y='R²', 
                              title='R² Score (Higher is Better)', color='R²',
                              color_continuous_scale='RdYlGn',
@@ -370,7 +328,6 @@ else:
         fig_r2_fut.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
         st.plotly_chart(fig_r2_fut, use_container_width=True)
     
-    # Detailed metrics table
     st.subheader("📋 Detailed Forecast Metrics")
     
     st.dataframe(comparison.style
@@ -380,7 +337,7 @@ else:
                  use_container_width=True)
 
 
-# Footer
+
 st.markdown("---")
 st.markdown("**Data Source:** OpenWeatherMap API | **Location:** Karachi, Pakistan")
 st.markdown(f"**Last Dashboard View:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
