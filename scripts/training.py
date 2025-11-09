@@ -563,10 +563,23 @@ for name in model_names:
             dmat = DMatrix(X, feature_names=SELECTED_FEATURES)
             pred = model.predict(dmat)
         elif name == "best_checkpoint":
-            # Handle checkpoint model based on its type
-            if current_checkpoint_name == "xgboost":
+            # Handle checkpoint model - check actual model type, not just the name
+            print(f"  Checkpoint model type: {type(model).__name__}")
+            print(f"  Expected type from history: {current_checkpoint_name}")
+            
+            # Check if it's an XGBoost Booster (from xgb.train)
+            if hasattr(model, 'predict') and type(model).__name__ == 'Booster':
                 dmat = DMatrix(X, feature_names=SELECTED_FEATURES)
                 pred = model.predict(dmat)
+            # Check if it's an XGBRegressor
+            elif type(model).__name__ == 'XGBRegressor' or current_checkpoint_name == "xgboost":
+                try:
+                    # Try DMatrix first
+                    dmat = DMatrix(X, feature_names=SELECTED_FEATURES)
+                    pred = model.predict(dmat)
+                except:
+                    # Fallback to numpy array
+                    pred = model.predict(X)
             elif current_checkpoint_name in ["ridge", "linear"]:
                 X_input = scaler.transform(X)
                 pred = model.predict(X_input)
@@ -589,8 +602,11 @@ for name in model_names:
         # Clip predictions
         pred = np.clip(np.round(pred).astype(int), 0, 500)
         predictions[name] = pred
+        print(f"  ✓ Prediction successful: {len(pred)} values")
     except Exception as e:
-        print(f"Prediction error for {name}: {e}")
+        print(f"  ✗ Prediction error for {name}: {e}")
+        import traceback
+        traceback.print_exc()
         # Use zeros instead of NaN to avoid downstream errors
         predictions[name] = np.zeros(len(X), dtype=int)
 
@@ -628,7 +644,14 @@ for name in [n for n in model_names if n in df_pred.columns]:
     
     # Check if predictions are valid
     if np.all(y_pred == 0):
-        print(f"Warning: {name} predictions are all zeros (likely failed). Skipping metrics.")
+        print(f"⚠️  Warning: {name} predictions are all zeros (prediction failed). Skipping metrics.")
+        metrics_list.append({
+            "Model": f"{name} (FAILED)",
+            "MAE": 999.0,
+            "RMSE": 999.0,
+            "R²": -999.0,
+            "MAPE": 999.0
+        })
         continue
     
     try:
@@ -649,7 +672,14 @@ for name in [n for n in model_names if n in df_pred.columns]:
             "MAPE": round(mape, 2)
         })
     except Exception as e:
-        print(f"Error calculating metrics for {name}: {e}")
+        print(f"❌ Error calculating metrics for {name}: {e}")
+        metrics_list.append({
+            "Model": f"{name} (ERROR)",
+            "MAE": 999.0,
+            "RMSE": 999.0,
+            "R²": -999.0,
+            "MAPE": 999.0
+        })
 
 df_metrics = pd.DataFrame(metrics_list)
 df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
