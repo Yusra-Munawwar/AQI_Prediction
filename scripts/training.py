@@ -1,6 +1,3 @@
-# =============================================================================
-# AQI TRAINING AND FORECASTING PIPELINE (training.py)
-# =============================================================================
 import pandas as pd
 import numpy as np
 import joblib
@@ -8,9 +5,8 @@ import hopsworks
 import os
 import json
 import requests
+from datetime import datetime
 import matplotlib.pyplot as plt
-
-from datetime import datetime, timezone
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.preprocessing import StandardScaler
@@ -19,19 +15,57 @@ from sklearn.model_selection import TimeSeriesSplit
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as cb
+from datetime import datetime as dt_datetime
+import time
 
-# =============================================================================
-# GLOBAL CONFIGURATION
-# =============================================================================
-# Note: HOPSWORKS_API_KEY is read from environment variable or set above
-API_KEY = "29e4f8ef9151633260fb36745ed19012"  # OWM API Key for Forecast
-LAT = 24.8607
-LON = 67.0011
-HISTORIC_PATH = "data/2years_features_clean.csv"
-MODEL_ARTIFACTS_DIR = "model_artifacts"
-PLOTS_DIR = "model_comparison_plots"
+def utcfromtimestamp(ts):
+    return pd.Timestamp(dt_datetime.utcfromtimestamp(ts), tz='UTC')
 
-# Features used for training (Lag features were excluded in the new list)
+# --- CONFIGURATION ---
+# Note: OWM_API_KEY and HOPSWORKS_API_KEY must be set in the environment
+API_KEY = os.getenv("OWM_API_KEY") 
+LAT = 24.8607    # Karachi latitude
+LON = 67.0011    # Karachi longitude
+HISTORIC_PATH = "data/2years_features_clean.csv" 
+PERFORMANCE_FILE = "model_artifacts/best_model_performance.json"
+CHECKPOINT_MODEL_PATH = "model_artifacts/best_model.pkl"
+
+# AQI TRAINING & FORECAST PIPELINE (Combined Script with Checkpointing)
+# PART 1: MODEL TRAINING
+print("\n" + "="*80)
+print("PART 1: FETCH TRAINING DATA")
+print("="*80)
+
+def fetch_training_data():
+    """Fetches training data from Hopsworks Feature Store or falls back to CSV."""
+    try:
+        
+        project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
+        fs = project.get_feature_store()
+        # Ensure the feature group name and version are correct
+        fg = fs.get_feature_group(name="aqi_features", version=4)
+        cols = ['datetime_utc', 'us_aqi'] + [
+            'pm2_5', 'pm10', 'co', 'no2', 'so2',
+            'month_cos', 'total_pm', 'total_gases',
+            'no2_o3_ratio', 'pm2_5_rolling_3h', 'pm10_rolling_3h',
+            'co_rolling_3h', 'pm2_5_co_interaction',
+            'hour_sin', 'hour_cos'
+        ]
+        df = fg.select(cols).read()
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', utc=True)
+        print(f"Fetched from Hopsworks: {df.shape}")
+        return df
+    except Exception as e:
+        print(f"Hopsworks failed: {e}")
+        # Fallback to local historic CSV data
+        df = pd.read_csv(HISTORIC_PATH) 
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+        print(f"Fallback CSV: {df.shape}")
+        return df
+
+df = fetch_training_data()
+df = df.sort_values('datetime_utc').reset_index(drop=True)
+
 SELECTED_FEATURES = [
     'pm2_5', 'pm10', 'co', 'no2', 'so2',
     'month_cos', 'total_pm', 'total_gases',
@@ -40,75 +74,28 @@ SELECTED_FEATURES = [
     'hour_sin', 'hour_cos'
 ]
 
-# =============================================================================
-# PART 1: MODEL TRAINING AND CHECKPOINTING
-# =============================================================================
-
-# ----------------------------------------------------------------------
-# 1. FETCH DATA
-# ----------------------------------------------------------------------
-print("\n" + "="*80)
-print("PART 1: MODEL TRAINING AND CHECKPOINTING")
-print("FETCHING TRAINING DATA")
-print("="*80)
-
-def fetch_training_data():
-    """Fetches data from Hopsworks Feature Store or falls back to CSV."""
-    try:
-        project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group(name="aqi_features", version=4)
-        
-        # Ensure 'us_aqi' and 'datetime_utc' are included for training/splitting
-        cols_to_fetch = ['datetime_utc', 'us_aqi'] + SELECTED_FEATURES
-        
-        df = fg.select(cols_to_fetch).read()
-        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], unit='ms', utc=True)
-        print(f"Fetched from Hopsworks: {df.shape}")
-        return df
-    except Exception as e:
-        print(f"Hopsworks failed: {e}. Falling back to CSV.")
-        df = pd.read_csv(HISTORIC_PATH)
-        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
-        # Ensure features are present, fill missing with 0
-        df = df[['datetime_utc', 'us_aqi'] + SELECTED_FEATURES].fillna(0)
-        print(f"Fallback CSV: {df.shape}")
-        return df
-
-df = fetch_training_data()
-df = df.sort_values('datetime_utc').reset_index(drop=True)
-
-# ----------------------------------------------------------------------
-# 2. DATA PREPARATION (NO LAGS USED IN X)
-# ----------------------------------------------------------------------
+# Prepare data for time series split
 X = df[SELECTED_FEATURES].fillna(0).values
 y = df['us_aqi'].values
 
-# ----------------------------------------------------------------------
-# 3. SPLIT
-# ----------------------------------------------------------------------
 n = len(X)
 train_end = int(0.7 * n)
-val_end   = int(0.8 * n)
+val_end    = int(0.8 * n)
 
 X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
 y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
-# ----------------------------------------------------------------------
-# 4. SCALING
-# ----------------------------------------------------------------------
+# Standardize data for linear models
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_val_scaled   = scaler.transform(X_val)
 X_test_scaled  = scaler.transform(X_test)
 
-os.makedirs(MODEL_ARTIFACTS_DIR, exist_ok=True)
-joblib.dump(scaler, f"{MODEL_ARTIFACTS_DIR}/scaler.pkl")
+os.makedirs("model_artifacts", exist_ok=True)
+joblib.dump(scaler, "model_artifacts/scaler.pkl")
 
-# ----------------------------------------------------------------------
-# 5. METRICS FUNCTION
-# ----------------------------------------------------------------------
 def calc_metrics(y_true, y_pred, name=""):
+    """Calculates and prints standard regression metrics."""
     mae  = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2   = r2_score(y_true, y_pred)
@@ -117,14 +104,8 @@ def calc_metrics(y_true, y_pred, name=""):
     print(f"{name:18} MAE: {mae:6.3f} | RMSE: {rmse:6.3f} | R²: {r2:6.3f} | MAPE: {mape:6.2f}%")
     return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}
 
-# ----------------------------------------------------------------------
-# 6. TIME-SERIES CV
-# ----------------------------------------------------------------------
-tscv = TimeSeriesSplit(n_splits=5)
 
-# ----------------------------------------------------------------------
-# 7. TRAIN MODELS (SAVE ALL)
-# ----------------------------------------------------------------------
+tscv = TimeSeriesSplit(n_splits=5)
 models      = {}
 cv_scores   = {}
 all_metrics = {"train": {}, "val": {}, "test": {}, "cv_mae": {}}
@@ -134,211 +115,243 @@ print("TRAINING & SAVING ALL MODELS")
 print("="*80)
 
 def train_with_cv(model, name, use_scaled=False):
-    """Trains a model with TimeSeries CV and fits the final model."""
+    """Trains a model with TimeSeries CV and calculates final metrics."""
     X_tr = X_train_scaled if use_scaled else X_train
     X_va = X_val_scaled   if use_scaled else X_val
-    X_te = X_test_scaled  if use_scaled else X_test
-
-    # --- 5-fold CV ---
+    X_te = X_test_scaled    if use_scaled else X_test
+    
     cv_mae = []
+    # 1. Cross-Validation on Training Set
     for tr_idx, val_idx in tscv.split(X_tr):
         X_f_tr, X_f_va = X_tr[tr_idx], X_tr[val_idx]
         y_f_tr, y_f_va = y_train[tr_idx], y_train[val_idx]
 
-        m = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
-        
+        # Handle specific models with custom fit behavior (like early stopping)
         if name == "xgboost":
-            # XGBoost training for CV fold
-            dtrain = xgb.DMatrix(X_f_tr, label=y_f_tr)
-            dval   = xgb.DMatrix(X_f_va, label=y_f_va)
-            params = model.get_xgb_params()
-            bst = xgb.train(
-                params, dtrain, num_boost_round=model.n_estimators, evals=[(dval, "eval")],
-                early_stopping_rounds=50, verbose_eval=False
-            )
-            pred = bst.predict(dval)
+            m = xgb.XGBRegressor(**model.get_params())
+            m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], verbose=False)
         elif name == "lightgbm":
-            # LightGBM training for CV fold
+            m = lgb.LGBMRegressor(**model.get_params())
             m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], 
-                  callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-            pred = m.predict(X_f_va)
+                              callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)])
         else:
-            # All other models (RF, GB, Ridge, Linear, CatBoost)
+            m = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
             m.fit(X_f_tr, y_f_tr)
-            pred = m.predict(X_f_va)
 
+        pred = m.predict(X_f_va)
         cv_mae.append(mean_absolute_error(y_f_va, pred))
 
     cv_mae_mean = np.mean(cv_mae)
     print(f"{name:12} CV MAE: {cv_mae_mean:.3f}")
 
-    # --- Final fit on full train set ---
-    final_model = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
+    # 2. Final Fit on entire Training Set
+    final_model = model
+    final_model.fit(X_tr, y_train)
     
-    if name == "xgboost":
-        # Final XGBoost fit
-        dtrain_full = xgb.DMatrix(X_tr, label=y_train)
-        dval_full   = xgb.DMatrix(X_va, label=y_val)
-        params = model.get_xgb_params()
-        final_model = xgb.train(
-            params, dtrain_full, num_boost_round=model.n_estimators, evals=[(dval_full, "eval")],
-            early_stopping_rounds=50, verbose_eval=False
-        )
-    elif name == "lightgbm":
-        # Final LightGBM fit
-        final_model.fit(X_tr, y_train, eval_set=[(X_va, y_val)], 
-                        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-    else:
-        # Final fit for all others
-        final_model.fit(X_tr, y_train)
+    # 3. Evaluation on Train, Val, Test sets
+    pred_train = final_model.predict(X_tr)
+    pred_val   = final_model.predict(X_va)
+    pred_test  = final_model.predict(X_te)
 
-    # --- Predictions for metrics ---
-    if name == "xgboost":
-        pred_train = final_model.predict(xgb.DMatrix(X_tr))
-        pred_val   = final_model.predict(xgb.DMatrix(X_va))
-        pred_test  = final_model.predict(xgb.DMatrix(X_te))
-    else:
-        pred_train = final_model.predict(X_tr)
-        pred_val   = final_model.predict(X_va)
-        pred_test  = final_model.predict(X_te)
-
-    # Store metrics
     all_metrics['train'][name] = calc_metrics(y_train, pred_train, f"{name} Train")
     all_metrics['val'][name]   = calc_metrics(y_val,   pred_val,   f"{name} Val")
     all_metrics['test'][name]  = calc_metrics(y_test,  pred_test,  f"{name} Test")
     all_metrics['cv_mae'][name] = cv_mae_mean
 
-    # Save this model
-    model_path = f"{MODEL_ARTIFACTS_DIR}/model_{name}.pkl"
+    model_path = f"model_artifacts/model_{name}.pkl"
     joblib.dump(final_model, model_path)
-    print(f"Saved: {model_path}")
 
-    # Store in dict
     models[name] = final_model
     cv_scores[name] = cv_mae_mean
+    return models, cv_scores
 
-# --------------------- TRAIN ALL MODELS ---------------------
+# TRAINING ALL MODELS 
 
-xgb_model = xgb.XGBRegressor(
-    n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.7, 
-    colsample_bytree=0.7, reg_alpha=1.0, reg_lambda=2.0, random_state=42, n_jobs=-1
-)
-train_with_cv(xgb_model, "xgboost")
+print("1. XGBoost")
+xgb_model = xgb.XGBRegressor(n_estimators=400, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(xgb_model, "xgboost")
 
-lgb_model = lgb.LGBMRegressor(
-    n_estimators=500, max_depth=3, learning_rate=0.05, subsample=0.7, 
-    colsample_bytree=0.7, reg_alpha=1.0, reg_lambda=2.0, random_state=42, n_jobs=-1
-)
-train_with_cv(lgb_model, "lightgbm")
+print("2. LightGBM")
+lgb_model = lgb.LGBMRegressor(n_estimators=1000, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(lgb_model, "lightgbm")
 
-cb_model = cb.CatBoostRegressor(
-    iterations=500, depth=5, learning_rate=0.05, l2_leaf_reg=3, random_seed=42, verbose=False
-)
-train_with_cv(cb_model, "catboost")
+print("3. CatBoost")
+cb_model = cb.CatBoostRegressor(iterations=500, depth=5, learning_rate=0.05, l2_leaf_reg=3, random_seed=42, verbose=False)
+models, cv_scores = train_with_cv(cb_model, "catboost")
 
-rf_model = RandomForestRegressor(
-    n_estimators=300, max_depth=8, min_samples_split=20, min_samples_leaf=10, 
-    random_state=42, n_jobs=-1
-)
-train_with_cv(rf_model, "rf")
+print("4. Random Forest")
+rf_model = RandomForestRegressor(n_estimators=300, max_depth=8, min_samples_split=20, min_samples_leaf=10, random_state=42, n_jobs=-1)
+models, cv_scores = train_with_cv(rf_model, "rf")
 
-gb_model = GradientBoostingRegressor(
-    n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8, 
-    min_samples_split=20, min_samples_leaf=10, random_state=42
-)
-train_with_cv(gb_model, "gb")
+print("5. Gradient Boosting")
+gb_model = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8, min_samples_split=20, min_samples_leaf=10, random_state=42)
+models, cv_scores = train_with_cv(gb_model, "gb")
 
+print("6. Ridge (Requires Scaling)")
 ridge_model = Ridge(alpha=10.0, random_state=42)
-train_with_cv(ridge_model, "ridge", use_scaled=True)
+models, cv_scores = train_with_cv(ridge_model, "ridge", use_scaled=True)
 
+print("7. Linear (Requires Scaling)")
 lr_model = LinearRegression()
-train_with_cv(lr_model, "linear", use_scaled=True)
+models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
 
-# ----------------------------------------------------------------------
-# 8. BEST MODEL AND CHECKPOINT (Minimal logic for current run only)
-# ----------------------------------------------------------------------
-best_name = min(cv_scores, key=cv_scores.get)
-best_mod  = models[best_name]
+# BEST MODEL CHECKPOINTING LOGIC
+
+best_name_cv = min(cv_scores, key=cv_scores.get)
+best_mod_cv = models[best_name_cv]
+new_cv_mae = cv_scores[best_name_cv]
+is_new_best = False
 
 print("\n" + "="*80)
-print(f"BEST MODEL (CURRENT RUN): {best_name.upper()} | CV MAE: {cv_scores[best_name]:.3f}")
+print(f"CURRENT RUN BEST (CV): {best_name_cv.upper()} | CV MAE: {new_cv_mae:.3f}")
 print("="*80)
 
-# Save best model separately for inference (uses the name in the path)
-best_model_path = f"{MODEL_ARTIFACTS_DIR}/best_model_{best_name}.pkl"
-joblib.dump(best_mod, best_model_path)
-print(f"Best model also saved: {best_model_path}")
+# Evaluate the current best on the Test set for checkpoint logging
+X_test_fin = X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test
+y_test_pred = best_mod_cv.predict(X_test_fin)
+new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW TEST METRICS")
+new_test_mae = new_test_metrics['mae']
 
-# Final test prediction with best model for summary
-X_test_fin = X_test_scaled if best_name in ["ridge", "linear"] else X_test
-if best_name == "xgboost":
-    y_test_pred = best_mod.predict(xgb.DMatrix(X_test_fin))
+# CHECKPOINT LOGIC (PRIORITIZING CV MAE) 
+historical_best_cv_mae = float('inf')
+historical_best_name = "N/A" 
+current_best_mae_test_only = float('inf') 
+current_best_name_test_only = "N/A"        
+
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            historical_best_cv_mae = prev_performance.get("cv_mae", float('inf')) 
+            historical_best_name = prev_performance.get("model_name", "N/A")
+            current_best_mae_test_only = prev_performance.get("test_mae", float('inf'))
+            current_best_name_test_only = prev_performance.get("model_name", "N/A") 
+            
+            print(f"Historical Best CV MAE: {historical_best_cv_mae:.3f} ({historical_best_name})")
+    except Exception as e:
+        print(f"Error loading {PERFORMANCE_FILE}: {e}. Starting fresh checkpoint.")
 else:
-    y_test_pred = best_mod.predict(X_test_fin)
-test_metrics = calc_metrics(y_test, y_test_pred, "FINAL TEST")
+    print("No previous best model performance found. Saving current CV best model.")
 
-# ----------------------------------------------------------------------
-# 9. SAVE ALL METRICS & CONFIG
-# ----------------------------------------------------------------------
-joblib.dump(SELECTED_FEATURES, f"{MODEL_ARTIFACTS_DIR}/selected_features.pkl")
+if new_cv_mae < historical_best_cv_mae:
+    print(f"✅ New model ({best_name_cv.upper()}) is more robust (CV MAE {new_cv_mae:.3f} < {historical_best_cv_mae:.3f}). Saving checkpoint.")
+    
+    # Save the new best model and update performance file
+    joblib.dump(best_mod_cv, CHECKPOINT_MODEL_PATH)
+    print(f"NEW BEST Model SAVED: {CHECKPOINT_MODEL_PATH}")
+    
+    performance_data = {
+        "model_name": best_name_cv,
+        "cv_mae": new_cv_mae,
+        "test_mae": new_test_mae, # Keep test MAE for reference
+        "test_r2": new_test_metrics['r2'],
+        "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+    with open(PERFORMANCE_FILE, "w") as f:
+        json.dump(performance_data, f, indent=2)
 
-with open(f"{MODEL_ARTIFACTS_DIR}/metrics.json", "w") as f:
+    is_new_best = True
+    final_best_name = best_name_cv
+    final_test_metrics = new_test_metrics
+else:
+    print(f"❌ Current CV best ({best_name_cv.upper()} MAE {new_cv_mae:.3f}) is not better than the historical best (MAE {historical_best_cv_mae:.3f}).")
+    print(f"Keeping the previously saved model: {historical_best_name.upper()}")
+    print(f"Keeping the previously saved {CHECKPOINT_MODEL_PATH} checkpoint.")
+    
+    is_new_best = False
+    final_best_name = historical_best_name 
+    # Use the current run's test metrics for the summary, but keep the historical name
+    final_test_metrics = new_test_metrics 
+
+# Determine the name of the model currently loaded in the checkpoint
+current_checkpoint_name = final_best_name 
+
+print("\n" + "="*80)
+print("CHECKPOINT COMPLETE")
+print("="*80)
+
+
+joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
+
+# Save detailed metrics for the current run
+with open("model_artifacts/metrics_current_run.json", "w") as f:
     json.dump({
-        "best_model": best_name,
+        "trained_best_model": best_name_cv, 
+        "new_test_metrics": new_test_metrics,
         "cv_mae": cv_scores,
         "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
-        "best_test": test_metrics,
+        "historical_best_cv_mae": historical_best_cv_mae, 
+        "is_new_historical_best": is_new_best,
         "features": SELECTED_FEATURES,
-        "scaler_needed": best_name in ["ridge", "linear"],
+        "scaler_needed": best_name_cv in ["ridge", "linear"],
         "all_models_saved": [f"model_{name}.pkl" for name in models],
         "all_metrics": all_metrics
     }, f, indent=2)
 
-print(f"All metrics saved to {MODEL_ARTIFACTS_DIR}/metrics.json")
+print(f"Current run metrics saved to model_artifacts/metrics_current_run.json")
 
-# ----------------------------------------------------------------------
-# 10. FINAL SUMMARY
-# ----------------------------------------------------------------------
 print("\n" + "="*80)
-print("TRAINING COMPLETE – ALL MODELS SAVED")
+print("TRAINING COMPLETE – CHECKPOINT STATUS")
 print("="*80)
-print(f"Best Model          : {best_name.upper()}")
-print(f"CV MAE              : {cv_scores[best_name]:.3f}")
-print(f"Test MAE            : {test_metrics['mae']:.3f}")
-print(f"Test R²             : {test_metrics['r2']:.3f}")
+# Summary uses the correct names/MAEs based on the checkpoint logic
+print(f"Best Model from Current Run : {best_name_cv.upper()} (CV MAE: {new_cv_mae:.3f})")
+print(f"Current Run Test MAE          : {new_test_metrics['mae']:.3f}")
+print(f"Historical Best Test MAE    : {current_best_mae_test_only:.3f} ({current_best_name_test_only})") 
+print(f"STATUS                      : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
+print(f"Saved Checkpoint Model Name : {current_checkpoint_name.upper()}")
+print(f"Saved Checkpoint Location   : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
 
-# =============================================================================
-# PART 2: 96-HOUR AQI FORECAST
-# =============================================================================
+# PART 2: FORECASTING
+
+MODEL_PATHS = {
+    "xgboost":    "model_artifacts/model_xgboost.pkl",
+    "lightgbm":  "model_artifacts/model_lightgbm.pkl",
+    "catboost":  "model_artifacts/model_catboost.pkl",
+    "rf":        "model_artifacts/model_rf.pkl",
+    "gb":        "model_artifacts/model_gb.pkl",
+    "ridge":     "model_artifacts/model_ridge.pkl",
+    "linear":    "model_artifacts/model_linear.pkl"
+}
+
+MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH 
+
+# Retrieve the name of the model currently saved in the checkpoint file for logging
+UNDERLYING_CHECKPOINT_MODEL = "N/A"
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            UNDERLYING_CHECKPOINT_MODEL = prev_performance.get("model_name", "N/A")
+    except Exception:
+        pass
+
 print("\n" + "#"*80)
 print("PART 2: 96-HOUR AQI FORECAST")
+print(f"Checkpoint Model Used for Forecast: {UNDERLYING_CHECKPOINT_MODEL.upper()}")
 print("#"*80)
 
-# ----------------------------------------------------------------------
-# 0. CONFIG AND MODEL LOADING
-# ----------------------------------------------------------------------
-MODEL_PATHS = {f"{name}": f"{MODEL_ARTIFACTS_DIR}/model_{name}.pkl" for name in models.keys()}
-SCALER_PATH = f"{MODEL_ARTIFACTS_DIR}/scaler.pkl"
-FEATURES_PATH = f"{MODEL_ARTIFACTS_DIR}/selected_features.pkl"
+# Load artifacts
+try:
+    scaler = joblib.load("model_artifacts/scaler.pkl")
+    SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
+except Exception as e:
+    print(f"Error loading necessary artifacts (scaler/features): {e}. Exiting forecast.")
+    exit(1)
 
-# Load scaler & features
-scaler = joblib.load(SCALER_PATH)
-SELECTED_FEATURES = joblib.load(FEATURES_PATH)
-
-# Load models
-forecast_models = {}
+models = {}
 for name, path in MODEL_PATHS.items():
     try:
-        forecast_models[name] = joblib.load(path)
+        if name == 'best_checkpoint' and not os.path.exists(path):
+             print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
+             continue
+        models[name] = joblib.load(path)
     except Exception as e:
-        print(f"Failed to load {name}: {e}")
+        print(f"Failed to load {name} from {path}: {e}")
 
-print(f"Loaded {len(forecast_models)} models for forecasting.")
+print(f"Loaded {len(models)} models for prediction.")
 
-# ----------------------------------------------------------------------
-# 1. US-AQI CONVERSION (Copied from your provided code)
-# ----------------------------------------------------------------------
+# --- EPA AQI Breakpoints (Required for calculating 'Actual_AQI' from OWM components) ---
 breakpoints = {
     'pm2_5': [(0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
               (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)],
@@ -359,173 +372,247 @@ breakpoints = {
 }
 
 def to_epa_units(c, pollutant):
+    """Converts OpenWeatherMap units (ug/m3 or mg/m3) to EPA standard units (ppm/ppb) for AQI calculation."""
     if pd.isna(c) or c <= 0: return 0.0
-    if pollutant == 'co':  return c / 1145.0
-    if pollutant == 'o3':  return c / 1960.6
-    if pollutant == 'no2':  return c / 1881.1
-    if pollutant == 'so2':  return c / 2620.0
+    # OWM provides CO in mg/m3. EPA standard is ppm. Conversion factor is 1145 mg/m3 per ppm.
+    if pollutant == 'co':    return c / 1145.0
+    # OWM provides O3 in ug/m3. EPA standard is ppm. Conversion factor: 1960.6 ug/m3 per ppm (at 25C)
+    if pollutant == 'o3':    return c / 1960.6
+    # OWM provides NO2 in ug/m3. EPA standard is ppb. Conversion factor: 1.8811 ug/m3 per ppb
+    if pollutant == 'no2':   return c / 1881.1
+    # OWM provides SO2 in ug/m3. EPA standard is ppb. Conversion factor: 2.620 ug/m3 per ppb
+    if pollutant == 'so2':   return c / 2620.0
+    # PMs (pm2_5, pm10) are already in ug/m3, which is the EPA standard for the concentration breakpoints.
     return c
 
 def calc_sub_aqi(c, pollutant):
+    """Calculates the individual pollutant's AQI score (sub-AQI)."""
     c_epa = to_epa_units(c, pollutant)
     bps = breakpoints.get(pollutant, [])
     if c_epa <= 0: return 0
     prev_high = -np.inf
+    
     for c_low, i_low, c_high, i_high in bps:
         if c_epa > prev_high and c_epa <= c_high:
+            # Linear interpolation: I_i = [(I_high - I_low) / (C_high - C_low)] * (C_i - C_low) + I_low
             return i_low + ((i_high - i_low) * (c_epa - c_low)) / (c_high - c_low)
         prev_high = c_high
+    # If concentration exceeds the highest breakpoint
     return 500
 
 def calc_us_aqi(row):
+    """Calculates the final US AQI as the maximum of all sub-AQI scores."""
     pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
+    # Note: OWM includes O3, which is necessary for calculating the official 'Actual_AQI'
     sub_aqis = [calc_sub_aqi(row.get(p, 0), p) for p in pollutants]
     return max(sub_aqis)
 
-# ----------------------------------------------------------------------
-# 2. FETCH 96-HOUR FORECAST
-# ----------------------------------------------------------------------
 def get_pollution_forecast(lat, lon, api_key):
+    """Fetches the 96-hour air pollution forecast from OpenWeatherMap."""
+    if not api_key:
+        raise ValueError("OWM_API_KEY is missing or empty! Cannot fetch live data.")
+    
     url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        raise ValueError(f"API error: {resp.text}")
-    data = resp.json()
-    rows = []
-    for item in data['list']:
-        dt = datetime.fromtimestamp(item['dt'], tz=timezone.utc)
-        comp = item['components']
-        rows.append({
-            'datetime_utc': dt,
-            'pm2_5': comp['pm2_5'], 'pm10': comp['pm10'], 'co': comp['co'],
-            'no2': comp['no2'], 'o3': comp['o3'], 'so2': comp['so2']
-        })
-    df = pd.DataFrame(rows)
-    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
-    return df.head(96)
+    print(f"Requesting forecast from: {url}")
+    
+    try:
+        # Use a retry loop with exponential backoff for robustness
+        max_retries = 3
+        retry_delay = 1
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, timeout=10)
+                break # Success
+            except requests.exceptions.RequestException as req_e:
+                if attempt < max_retries - 1:
+                    print(f"Request failed (Attempt {attempt+1}/{max_retries}): {req_e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise req_e
+
+        if resp is None:
+             raise Exception("Failed to get response after multiple retries.")
+             
+        print(f"API Response Status: {resp.status_code}")
+        
+        if resp.status_code == 401:
+            raise ValueError("Invalid OWM_API_KEY: Unauthorized (401). Check your OpenWeatherMap API key.")
+        if resp.status_code == 429:
+            raise ValueError("Rate limited by OpenWeatherMap (429). Too many requests.")
+        if resp.status_code != 200:
+            raise ValueError(f"API error {resp.status_code}: {resp.text}")
+        
+        data = resp.json()
+        if 'list' not in data or len(data['list']) == 0:
+            raise ValueError("Empty forecast data returned from API.")
+        
+        rows = []
+        for item in data['list']:
+            dt = utcfromtimestamp(item['dt'])
+            comp = item['components']
+            rows.append({
+                'datetime_utc': dt,
+                # OWM pollutants are in: pm2_5/pm10 (ug/m3), co (mg/m3), no2/o3/so2 (ug/m3)
+                'pm2_5': comp.get('pm2_5', 0), 
+                'pm10': comp.get('pm10', 0), 
+                'co': comp.get('co', 0),
+                'no2': comp.get('no2', 0), 
+                'o3': comp.get('o3', 0), 
+                'so2': comp.get('so2', 0)
+            })
+        df = pd.DataFrame(rows)
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+        print(f"Successfully fetched {len(df)} forecast hours.")
+        return df.head(96) # Cap at 96 hours (4 days)
+    
+    except requests.exceptions.Timeout:
+        raise ValueError("Request to OpenWeatherMap timed out.")
+    except requests.exceptions.ConnectionError:
+        raise ValueError("Failed to connect to OpenWeatherMap. Check internet or DNS.")
+    except Exception as e:
+        print(f"Unexpected error in get_pollution_forecast: {type(e).__name__}: {e}")
+        raise
 
 print("Fetching 96-hour forecast...")
-df_forecast = get_pollution_forecast(LAT, LON, API_KEY)
-df_forecast['Actual_AQI'] = df_forecast.apply(calc_us_aqi, axis=1).round().astype(int).clip(0, 500)
+try:
+    # Fetch forecast data and calculate the EPA-official AQI from the raw components
+    df_forecast = get_pollution_forecast(LAT, LON, API_KEY)
+    df_forecast['Actual_AQI'] = df_forecast.apply(calc_us_aqi, axis=1).round().astype(int).clip(0, 500)
+except Exception as e:
+    # Error handling and fallback if API call fails
+    print(f"FORECAST FAILED: {e}")
+    os.makedirs("data", exist_ok=True)
+    # Create dummy dataframes to prevent downstream errors
+    dummy = pd.DataFrame({
+        'datetime': [pd.Timestamp.now(tz='UTC')], 'Actual_AQI': [0],
+        'xgboost': [0], 'lightgbm': [0], 'catboost': [0], 'rf': [0], 'gb': [0],
+        'ridge': [0], 'linear': [0], 'Closest_Model': ['error'], 
+        'Checkpoint_Model_Name': ['error']
+    })
+    if os.path.exists(CHECKPOINT_MODEL_PATH):
+        dummy['best_checkpoint'] = [0]
+    dummy.to_csv("data/future_aqi_predictions.csv", index=False)
+    pd.DataFrame([{"Model": "ERROR", "MAE": 999, "RMSE": 999, "R²": -1, "MAPE": 999}]).to_csv("data/future_prediction_comparison.csv", index=False)
+    print("Pipeline completed with forecast fallback.")
+    exit(0)
 
-# ----------------------------------------------------------------------
-# 3. LOAD HISTORIC DATA
-# ----------------------------------------------------------------------
+# Load the last few historical points to compute rolling features for the forecast
 print(f"Loading historic data from {HISTORIC_PATH}...")
 df_hist = pd.read_csv(HISTORIC_PATH)
-df_hist['datetime_utc'] = pd.to_datetime(df_hist['datetime_utc'], utc=True, errors='coerce')
-df_hist = df_hist.dropna(subset=['datetime_utc', 'us_aqi'])
+# Use a robust parsing method, though ISO8601 is expected from the training part
+df_hist['datetime_utc'] = pd.to_datetime(df_hist['datetime_utc'], utc=True, errors='coerce') 
+df_hist = df_hist.dropna(subset=['datetime_utc'])
 df_hist = df_hist.sort_values('datetime_utc').reset_index(drop=True)
 last_3 = df_hist.tail(3)
 
-# ----------------------------------------------------------------------
-# 4. BUILD FEATURES (Matching the selected features for inference)
-# ----------------------------------------------------------------------
 def build_features(df_fc, last_hist):
-    """Builds the 15 selected features for the forecast dataframe."""
+    """Generates the same features used in training on the forecast data."""
     df = df_fc.copy()
     
-    # Temporal features
+    # Time-based features
     df['hour'] = df['datetime_utc'].dt.hour
     df['month'] = df['datetime_utc'].dt.month
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
-    # Interaction/Derived features
+    # Derived features
     df['total_pm'] = df['pm2_5'] + df['pm10']
-    df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
+    df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2'] # Note: O3 is only used here, not in the trained model features
     df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
     df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
 
-    # Rolling means (using last 3 historic points + forecast data)
-    combined = pd.concat([last_hist[['pm2_5', 'pm10', 'co']], df[['pm2_5', 'pm10', 'co']]], ignore_index=True)
+    # Rolling window features (requires lookback into historic data)
+    combined = pd.concat([last_hist[['pm2_5', 'pm10', 'co']].tail(2), df[['pm2_5', 'pm10', 'co']]], ignore_index=True)
     
-    # Calculate rolling means on combined, then take only the last 96 forecast rows
-    df['pm2_5_rolling_3h'] = combined['pm2_5'].rolling(3, min_periods=1).mean().iloc[-len(df):].values
-    df['pm10_rolling_3h']  = combined['pm10'].rolling(3, min_periods=1).mean().iloc[-len(df):].values
-    df['co_rolling_3h']    = combined['co'].rolling(3, min_periods=1).mean().iloc[-len(df):].values
+    # Calculate rolling features over the combined data, then slice back to only the forecast rows
+    # combined length: 2 (hist) + 96 (fc) = 98 rows. Start index for fc is 2.
+    df['pm2_5_rolling_3h'] = combined['pm2_5'].rolling(3, min_periods=1).mean().iloc[2:].values
+    df['pm10_rolling_3h']  = combined['pm10'].rolling(3, min_periods=1).mean().iloc[2:].values
+    df['co_rolling_3h']    = combined['co'].rolling(3, min_periods=1).mean().iloc[2:].values
 
+    # Lag features (if used, though not in SELECTED_FEATURES)
+    if 'us_aqi' in last_hist.columns:
+        df['us_aqi_lag1'] = last_hist['us_aqi'].iloc[-1]
+    else:
+        df['us_aqi_lag1'] = 0 
+        
     df = df.drop(columns=['hour', 'month'], errors='ignore')
-    
-    # Fill any remaining NaNs (should only be at the very start of the rolling window)
-    df = df.fillna(0)
-    
     return df
 
 df_fc_feat = build_features(df_forecast, last_3)
-X_df = df_fc_feat[SELECTED_FEATURES].fillna(0)
-X = X_df.values
-
-# ----------------------------------------------------------------------
-# 5. PREDICT WITH ALL MODELS
-# ----------------------------------------------------------------------
-from xgboost import DMatrix
-
+# Prepare feature matrix for prediction
+X = df_fc_feat[SELECTED_FEATURES].fillna(0).values
 predictions = {'datetime': df_fc_feat['datetime_utc'], 'Actual_AQI': df_fc_feat['Actual_AQI']}
-model_names = list(forecast_models.keys())
+model_names = list(models.keys())
 
+# Generate predictions for all models
 for name in model_names:
-    print(f"Predicting with {name}...")
-    model = forecast_models[name]
+    model = models[name]    
     
-    X_input = X_df.values # Default to unscaled numpy array
+    # Determine if scaling is needed for the current model prediction
+    is_linear_model = name in ["ridge", "linear"]
+    is_checkpoint_linear = name == "best_checkpoint" and UNDERLYING_CHECKPOINT_MODEL in ["ridge", "linear"]
+    
+    if is_linear_model or is_checkpoint_linear:
+        X_input = scaler.transform(X)
+    else:
+        X_input = X
 
-    try:
-        if name == "xgboost":
-            dmat = DMatrix(X_input, feature_names=SELECTED_FEATURES)
-            pred = model.predict(dmat)
-        elif name in ["lightgbm", "catboost", "rf", "gb"]:
-            pred = model.predict(X_input)
-        elif name in ["ridge", "linear"]:
-            # Scale for linear models
-            pred = model.predict(scaler.transform(X_input))
-        else:
-            raise ValueError(f"Unknown model name: {name}")
+    pred = model.predict(X_input)
+    # Clip predictions to realistic AQI range [0, 500]
+    pred = np.clip(pred.round().astype(int), 0, 500)
+    predictions[name] = pred
 
-        # Clip predictions to valid AQI range and round
-        pred = np.clip(np.round(pred).astype(int), 0, 500)
-        predictions[name] = pred
-    except Exception as e:
-        print(f"Prediction error for {name}: {e}")
-        predictions[name] = np.full(len(X_df), np.nan)
-
-# Closest Model (based on error vs OWM's calculated AQI)
-abs_errors = np.abs(np.array([predictions[m] for m in model_names]) - predictions['Actual_AQI'].values)
+# Determine which model was closest to the 'Actual_AQI' at each hour (excluding the checkpoint)
+model_names_for_error = [name for name in model_names if name != 'best_checkpoint']
+abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - predictions['Actual_AQI'].values)
 closest_idx = np.argmin(abs_errors, axis=0)
-predictions['Closest_Model'] = [model_names[i] for i in closest_idx]
+predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
 
-# ----------------------------------------------------------------------
-# 6. SAVE future_aqi_predictions.csv
-# ----------------------------------------------------------------------
-cols = ['datetime', 'Actual_AQI'] + model_names + ['Closest_Model']
+# Final DataFrame assembly
+cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear']
+predictions['Checkpoint_Model_Name'] = UNDERLYING_CHECKPOINT_MODEL
+
+if 'best_checkpoint' in predictions:
+    cols.append('best_checkpoint')
+    
+cols.append('Closest_Model')
+cols.append('Checkpoint_Model_Name') 
+
 df_pred = pd.DataFrame(predictions)[cols]
-df_pred.to_csv("future_aqi_predictions.csv", index=False)
+df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
 print("Saved: future_aqi_predictions.csv")
 
-# ----------------------------------------------------------------------
-# 7. METRICS → future_prediction_comparison.csv
-# ----------------------------------------------------------------------
+# Calculate prediction comparison metrics for the forecast period
 y_true = df_pred['Actual_AQI'].values
 metrics_list = []
+checkpoint_name_in_file = "N/A"
 
-for name in model_names:
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            checkpoint_name_in_file = prev_performance.get("model_name", "N/A")
+    except Exception as e:
+        print(f"Warning: Could not load historical name from {PERFORMANCE_FILE}: {e}")
+
+for name in [n for n in model_names if n in df_pred.columns]:
     y_pred = df_pred[name].values
-    # Filter out NaNs if prediction failed for a model
-    valid_mask = ~np.isnan(y_pred)
-    y_true_v = y_true[valid_mask]
-    y_pred_v = y_pred[valid_mask]
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    # MAPE calculation adjusted for potential zero division by adding a small epsilon
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100 
     
-    if len(y_true_v) > 0:
-        mae = mean_absolute_error(y_true_v, y_pred_v)
-        rmse = np.sqrt(mean_squared_error(y_true_v, y_pred_v))
-        r2 = r2_score(y_true_v, y_pred_v)
-        mape = np.mean(np.abs((y_true_v - y_pred_v) / (y_true_v + 1e-6))) * 100
-    else:
-        mae, rmse, r2, mape = np.nan, np.nan, np.nan, np.nan
+    display_name = name
+    if name == 'best_checkpoint':
+        display_name = f"best_checkpoint ({checkpoint_name_in_file})"
         
     metrics_list.append({
-        "Model": name,
+        "Model": display_name,
         "MAE": round(mae, 3),
         "RMSE": round(rmse, 3),
         "R²": round(r2, 3),
@@ -533,26 +620,31 @@ for name in model_names:
     })
 
 df_metrics = pd.DataFrame(metrics_list)
-df_metrics.to_csv("future_prediction_comparison.csv", index=False)
+df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
 print("Saved: future_prediction_comparison.csv")
 print("\n" + df_metrics.to_string(index=False))
 
-# ----------------------------------------------------------------------
-# 8. PLOT — INDIVIDUAL MODEL GRAPHS
-# ----------------------------------------------------------------------
-print("Generating individual model comparison plots...")
-os.makedirs(PLOTS_DIR, exist_ok=True)
+# --- Plotting ---
+print("Generating model comparison plots...")
+
+os.makedirs("model_comparison_plots", exist_ok=True)
 
 actual = df_pred['Actual_AQI'].values
 dates = df_pred['datetime']
 
-for name in model_names:
+for name in [n for n in model_names if n in df_pred.columns]:
     pred = df_pred[name].values
+    
     plt.figure(figsize=(14, 6))
     plt.plot(dates, actual, label='Actual AQI (OWM)', color='black', linewidth=2.5, marker='o', markersize=3)
-    plt.plot(dates, pred, label=f'{name.upper()} Prediction', color='teal', linewidth=2.5, alpha=0.9)
+    
+    color = 'teal'
+    if name == 'best_checkpoint':
+        color = 'red'
+        
+    plt.plot(dates, pred, label=f'{name.upper()} Prediction', color=color, linewidth=2.5, alpha=0.9)
     plt.fill_between(dates, actual, pred, color='lightgray', alpha=0.5, label='Error Band')
-
+    
     plt.title(f'96-Hour AQI Forecast: Actual vs {name.upper()}', fontsize=15, fontweight='bold')
     plt.xlabel('Time (UTC)', fontsize=12)
     plt.ylabel('US AQI', fontsize=12)
@@ -560,10 +652,11 @@ for name in model_names:
     plt.grid(alpha=0.3)
     plt.xticks(rotation=45)
     plt.tight_layout()
-
+    
     safe_name = name.replace(" ", "_")
-    plt.savefig(f"{PLOTS_DIR}/{safe_name}_vs_actual.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"model_comparison_plots/{safe_name}_vs_actual.png", dpi=200, bbox_inches='tight')
+    # plt.show()
     plt.close()
 
-print(f"{len(model_names)} individual plots saved in: {PLOTS_DIR}/")
+print(f"{len([n for n in model_names if n in df_pred.columns])} plots saved in: model_comparison_plots/")
 print("\nAll done!")
