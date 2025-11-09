@@ -27,7 +27,7 @@ import catboost as cb
 API_KEY = "29e4f8ef9151633260fb36745ed19012"  # OWM API Key for Forecast
 LAT = 24.8607
 LON = 67.0011
-HISTORIC_PATH = "2years_features_clean.csv"
+HISTORIC_PATH = "data/2years_features_clean.csv"
 MODEL_ARTIFACTS_DIR = "model_artifacts"
 PLOTS_DIR = "model_comparison_plots"
 
