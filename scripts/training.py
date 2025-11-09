@@ -291,6 +291,7 @@ if new_cv_mae < historical_best_cv_mae:
     final_test_metrics = new_test_metrics
 else:
     print(f"❌ Current CV best ({best_name_cv.upper()} MAE {new_cv_mae:.3f}) is not better than the historical best (MAE {historical_best_cv_mae:.3f}).")
+    print(f"Keeping the previously saved model: {historical_best_name.upper()}") # <-- ADD THIS LINE
     print(f"Keeping the previously saved {CHECKPOINT_MODEL_PATH} checkpoint.")
     
     is_new_best = False
