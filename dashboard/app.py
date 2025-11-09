@@ -334,7 +334,7 @@ else:
     st.subheader("📋 Detailed Forecast Metrics")
     
     st.dataframe(comparison.style
-                 .highlight_min(subset=['MAE', 'RMSE'], color='#D5F4E6')
+                 .highlight_min(subset=['MAE', 'RMSE'], color='#E52B50')
                  .highlight_max(subset=['R²'], color='#E52B50')
                  .format({'MAE': '{:.3f}', 'RMSE': '{:.3f}', 'R²': '{:.3f}', 'MAPE': '{:.2f}%'}),
                  use_container_width=True)
