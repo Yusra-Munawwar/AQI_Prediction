@@ -186,26 +186,42 @@ if view_mode == "Historical Data":
     if not pollutant_cols:
         st.warning("⚠️ Could not find any of the standard raw pollutant columns (pm2_5, o3, etc.) in the historical data file.")
     else:
-        fig_pollutant = go.Figure()
+        # 🎯 START OF MODIFICATION: Create separate small graphs for each pollutant
+        
+        # Determine number of columns for display
+        num_cols = 3
+        cols = st.columns(num_cols)
+        
         colors = px.colors.qualitative.Bold
         
         for i, p in enumerate(pollutant_cols):
-            fig_pollutant.add_trace(go.Scatter(
-                x=filtered_data['datetime_utc'],
-                y=filtered_data[p], 
-                mode='lines',
-                name=p.upper(),
-                line=dict(color=colors[i % len(colors)], width=1.5)
-            ))
+            with cols[i % num_cols]:
+                fig_pollutant = go.Figure()
+                
+                fig_pollutant.add_trace(go.Scatter(
+                    x=filtered_data['datetime_utc'],
+                    y=filtered_data[p], 
+                    mode='lines',
+                    name=p.upper(),
+                    line=dict(color=colors[i % len(colors)], width=1.5),
+                    fill='tozeroy',
+                    fillcolor='rgba(150, 150, 150, 0.1)'
+                ))
 
-        fig_pollutant.update_layout(
-            title="Key Pollutant Concentrations",
-            xaxis_title="Date", 
-            yaxis_title="Concentration (units vary)", 
-            hovermode='x unified',
-            height=400
-        )
-        st.plotly_chart(fig_pollutant, use_container_width=True)
+                fig_pollutant.update_layout(
+                    title=f"**{p.upper()}**", # Make title prominent
+                    xaxis_title=None, 
+                    yaxis_title="Concentration", 
+                    hovermode='x unified',
+                    height=250, # Keep graphs small
+                    margin=dict(l=10, r=10, t=40, b=10) # Adjust margins
+                )
+                # Hide x-axis ticks for cleaner look, only keep the labels
+                fig_pollutant.update_xaxes(showticklabels=True) 
+                
+                st.plotly_chart(fig_pollutant, use_container_width=True)
+        # 🎯 END OF MODIFICATION
+
 
 # ============================================================================
 # FUTURE PREDICTIONS VIEW
@@ -218,7 +234,8 @@ elif view_mode == "Future Predictions":
         st.stop()
 
     # Determine available models dynamically
-    EXCLUDED_COLS = ['datetime_utc', 'Actual_AQI', 'Closest_Model']
+    # 🎯 MODIFICATION: Exclude the new 'Checkpoint_Model_Name' from model selection list
+    EXCLUDED_COLS = ['datetime_utc', 'Actual_AQI', 'Closest_Model', 'Checkpoint_Model_Name'] 
     available_models = [col for col in predictions.columns if col not in EXCLUDED_COLS]
     
     # Prioritize the best checkpoint model if available
@@ -276,20 +293,43 @@ elif view_mode == "Future Predictions":
     
     
     # Prediction table
-    st.subheader("📋 Detailed Hourly Predictions")
+    st.subheader("📋 Detailed Hourly Predictions (All Columns)") # 🎯 MODIFICATION: Title change
     
-    display_cols = ['datetime_utc', 'Actual_AQI', selected_model, 'Closest_Model']
-    display_df = predictions[display_cols].copy()
+    # 🎯 START OF MODIFICATION: Display all columns
+    display_df = predictions.copy()
+
+    # 1. Format the date column
     display_df['datetime_utc'] = display_df['datetime_utc'].dt.strftime('%Y-%m-%d %H:%M')
-    display_df[f'{selected_model} Error'] = abs(display_df['Actual_AQI'] - display_df[selected_model]).round(1)
-    
-    st.dataframe(
-        display_df.style
-        .highlight_max(subset=[f'{selected_model} Error'], color='#FFDBDB')
-        .format({'Actual_AQI': '{:.0f}', selected_model: '{:.0f}'}),
-        use_container_width=True, 
-        height=400
-    )
+
+    # 2. Add the selected model's error column 
+    if selected_model in display_df.columns:
+        try:
+            display_df[f'{selected_model} Error'] = abs(display_df['Actual_AQI'] - display_df[selected_model]).round(1)
+            
+            # Dynamically determine all model columns and format them as integers
+            all_model_cols = [col for col in predictions.columns if col not in ['datetime_utc', 'Actual_AQI', 'Closest_Model', 'Checkpoint_Model_Name']]
+            
+            format_cols = {col: '{:.0f}' for col in all_model_cols if col in display_df.columns}
+            format_cols.update({'Actual_AQI': '{:.0f}'})
+            
+            highlight_cols = [f'{selected_model} Error']
+
+        except (TypeError, ValueError):
+            st.warning(f"Error calculating error for {selected_model}. Displaying raw values.")
+            highlight_cols = []
+            format_cols = {}
+
+        # 3. Display the DataFrame
+        st.dataframe(
+            display_df.style
+            .highlight_max(subset=highlight_cols, color='#FFDBDB') # Highlight max error
+            .format(format_cols),
+            use_container_width=True, 
+            height=400
+        )
+    else:
+        st.warning(f"Model column '{selected_model}' not found in predictions data.")
+    # 🎯 END OF MODIFICATION
 
 
 # ============================================================================
@@ -323,9 +363,9 @@ else:
     with col2:
         # Forecast R²
         fig_r2_fut = px.bar(comparison.sort_values('R²', ascending=False), x='Model', y='R²', 
-                            title='R² Score (Higher is Better)', color='R²',
-                            color_continuous_scale='RdYlGn',
-                            text='R²')
+                             title='R² Score (Higher is Better)', color='R²',
+                             color_continuous_scale='RdYlGn',
+                             text='R²')
         fig_r2_fut.update_traces(texttemplate='%{text:.3f}', textposition='outside')
         fig_r2_fut.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
         st.plotly_chart(fig_r2_fut, use_container_width=True)
