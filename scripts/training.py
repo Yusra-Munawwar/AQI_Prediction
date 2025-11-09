@@ -16,11 +16,15 @@ import xgboost as xgb
 import lightgbm as lgb
 import catboost as cb
 from datetime import datetime as dt_datetime
+from xgboost import DMatrix  # <-- CRITICAL IMPORT
 import time
 
 def utcfromtimestamp(ts):
     return pd.Timestamp(dt_datetime.utcfromtimestamp(ts), tz='UTC')
 
+# =============================================================================
+# CONFIG
+# =============================================================================
 API_KEY = os.getenv("OWM_API_KEY")
 LAT = 24.8607  # Karachi latitude
 LON = 67.0011  # Karachi longitude
@@ -29,8 +33,7 @@ PERFORMANCE_FILE = "model_artifacts/best_model_performance.json"
 CHECKPOINT_MODEL_PATH = "model_artifacts/best_model.pkl"
 
 # =============================================================================
-#  AQI TRAINING – NO LAG, NO OVERFITTING, FIXED XGBoost EARLY STOPPING
-#  NOW SAVES ALL MODELS
+# PART 1: TRAINING (IMPROVED – NO LAG, EARLY STOPPING)
 # =============================================================================
 print("\n" + "="*80)
 print("PART 1: FETCH TRAINING DATA")
@@ -137,8 +140,8 @@ def train_with_cv(model, name, use_scaled=False):
         y_f_tr, y_f_va = y_train[tr_idx], y_train[val_idx]
 
         if name == "xgboost":
-            dtrain = xgb.DMatrix(X_f_tr, label=y_f_tr)
-            dval   = xgb.DMatrix(X_f_va, label=y_f_va)
+            dtrain = DMatrix(X_f_tr, label=y_f_tr)
+            dval   = DMatrix(X_f_va, label=y_f_va)
             params = model.get_xgb_params() if hasattr(model, "get_xgb_params") else model.get_params()
             bst = xgb.train(
                 params,
@@ -167,8 +170,8 @@ def train_with_cv(model, name, use_scaled=False):
 
     # --- Final fit on full train ---
     if name == "xgboost":
-        dtrain_full = xgb.DMatrix(X_tr, label=y_train)
-        dval_full   = xgb.DMatrix(X_va, label=y_val)
+        dtrain_full = DMatrix(X_tr, label=y_train)
+        dval_full   = DMatrix(X_va, label=y_val)
         params = model.get_xgb_params() if hasattr(model, "get_xgb_params") else model.get_params()
         final_model = xgb.train(
             params,
@@ -191,9 +194,9 @@ def train_with_cv(model, name, use_scaled=False):
 
     # --- Predictions ---
     if name == "xgboost":
-        pred_train = final_model.predict(xgb.DMatrix(X_tr))
-        pred_val   = final_model.predict(xgb.DMatrix(X_va))
-        pred_test  = final_model.predict(xgb.DMatrix(X_te))
+        pred_train = final_model.predict(DMatrix(X_tr))
+        pred_val   = final_model.predict(DMatrix(X_va))
+        pred_test  = final_model.predict(DMatrix(X_te))
     else:
         pred_train = final_model.predict(X_tr)
         pred_val   = final_model.predict(X_va)
@@ -210,20 +213,18 @@ def train_with_cv(model, name, use_scaled=False):
     joblib.dump(final_model, model_path)
     print(f"Saved: {model_path}")
 
-    # Store in dict
     models[name] = final_model
     cv_scores[name] = cv_mae_mean
 
 # --------------------- TRAIN ALL MODELS ---------------------
-
 xgb_model = xgb.XGBRegressor(
-    n_estimators=300,       # fewer trees
-    max_depth=3,            # shallower trees
+    n_estimators=300,
+    max_depth=3,
     learning_rate=0.05,
-    subsample=0.7,          # row subsampling
-    colsample_bytree=0.7,   # feature subsampling
-    reg_alpha=1.0,          # stronger L1 regularization
-    reg_lambda=2.0,         # stronger L2 regularization
+    subsample=0.7,
+    colsample_bytree=0.7,
+    reg_alpha=1.0,
+    reg_lambda=2.0,
     random_state=42,
     n_jobs=-1
 )
@@ -291,15 +292,17 @@ print("\n" + "="*80)
 print(f"CURRENT RUN BEST (CV): {best_name_cv.upper()} | CV MAE: {new_cv_mae:.3f}")
 print("="*80)
 
-X_test_fin = X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test
+# Final test prediction
 if best_name_cv == "xgboost":
-    y_test_pred = best_mod_cv.predict(xgb.DMatrix(X_test_fin))
+    y_test_pred = best_mod_cv.predict(DMatrix(X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test))
 else:
+    X_test_fin = X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test
     y_test_pred = best_mod_cv.predict(X_test_fin)
+
 new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW TEST METRICS")
 new_test_mae = new_test_metrics['mae']
 
-# CHECKPOINT LOGIC (PRIORITIZING CV MAE)
+# CHECKPOINT LOGIC
 historical_best_cv_mae = float('inf')
 historical_best_name = "N/A"
 current_best_mae_test_only = float('inf')
@@ -376,7 +379,7 @@ print(f"Saved Checkpoint Location : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
 
 # =============================================================================
-# PART 2: FORECASTING (UNCHANGED FROM ORIGINAL SCRIPT)
+# PART 2: 96-HOUR AQI FORECAST (FIXED FOR XGBOOST BOOSTER)
 # =============================================================================
 MODEL_PATHS = {
     "xgboost": "model_artifacts/model_xgboost.pkl",
@@ -388,14 +391,18 @@ MODEL_PATHS = {
     "linear": "model_artifacts/model_linear.pkl"
 }
 MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH
+
+# Load checkpoint model name
+current_checkpoint_name = "N/A"
 UNDERLYING_CHECKPOINT_MODEL = "N/A"
 if os.path.exists(PERFORMANCE_FILE):
     try:
         with open(PERFORMANCE_FILE, "r") as f:
             prev_performance = json.load(f)
             UNDERLYING_CHECKPOINT_MODEL = prev_performance.get("model_name", "N/A")
-    except Exception:
-        pass
+            current_checkpoint_name = UNDERLYING_CHECKPOINT_MODEL
+    except Exception as e:
+        print(f"Could not load checkpoint model name: {e}")
 
 print("\n" + "#"*80)
 print("PART 2: 96-HOUR AQI FORECAST")
@@ -407,31 +414,33 @@ models = {}
 for name, path in MODEL_PATHS.items():
     try:
         if name == 'best_checkpoint' and not os.path.exists(path):
-             print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
-             continue
+            print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
+            continue
         models[name] = joblib.load(path)
+        print(f"Loaded {name}")
     except Exception as e:
         print(f"Failed to load {name} from {path}: {e}")
 
 print(f"Loaded {len(models)} models for prediction.")
 
+# AQI Breakpoints
 breakpoints = {
     'pm2_5': [(0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
               (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)],
     'pm10': [(0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
-              (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
-              (505, 401, 604, 500)],
+             (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
+             (505, 401, 604, 500)],
     'o3': [(0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
-              (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
-              (0.405, 401, 0.604, 500)],
+           (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
+           (0.405, 401, 0.604, 500)],
     'no2': [(0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
-              (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
-              (1.050, 401, 2.104, 500)],
+            (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
+            (1.050, 401, 2.104, 500)],
     'so2': [(0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
-              (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
-              (0.186, 401, 0.604, 500)],
+            (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
+            (0.186, 401, 0.604, 500)],
     'co': [(0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
-              (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)]
+           (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)]
 }
 
 def to_epa_units(c, pollutant):
@@ -549,26 +558,41 @@ def build_features(df_fc, last_hist):
 
 df_fc_feat = build_features(df_forecast, last_3)
 X = df_fc_feat[SELECTED_FEATURES].fillna(0).values
+
+# =============================================================================
+# PREDICTION LOOP – FIXED FOR XGBOOST BOOSTER
+# =============================================================================
 predictions = {'datetime': df_fc_feat['datetime_utc'], 'Actual_AQI': df_fc_feat['Actual_AQI']}
 model_names = list(models.keys())
 
 for name in model_names:
     model = models[name]
-    if name in ["ridge", "linear"]:
-        X_input = scaler.transform(X)
-    elif name == "best_checkpoint" and current_checkpoint_name in ["ridge", "linear"]:
+    if name in ["ridge", "linear"] or (name == "best_checkpoint" and current_checkpoint_name in ["ridge", "linear"]):
         X_input = scaler.transform(X)
     else:
         X_input = X
-    pred = model.predict(X_input)
-    pred = np.clip(pred.round().astype(int), 0, 500)
+
+    try:
+        if name == "xgboost" or (name == "best_checkpoint" and current_checkpoint_name == "xgboost"):
+            pred = model.predict(DMatrix(X_input))
+        else:
+            pred = model.predict(X_input)
+        pred = np.clip(pred.round().astype(int), 0, 500)
+    except Exception as e:
+        print(f"Prediction failed for {name}: {e}")
+        pred = np.zeros(len(X_input))
     predictions[name] = pred
 
+# Closest Model
 model_names_for_error = [name for name in model_names if name != 'best_checkpoint']
-abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - predictions['Actual_AQI'].values)
-closest_idx = np.argmin(abs_errors, axis=0)
-predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
+if model_names_for_error:
+    abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - predictions['Actual_AQI'].values)
+    closest_idx = np.argmin(abs_errors, axis=0)
+    predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
+else:
+    predictions['Closest_Model'] = ["N/A"] * len(X)
 
+# Save predictions
 cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear']
 predictions['Checkpoint_Model_Name'] = UNDERLYING_CHECKPOINT_MODEL
 if 'best_checkpoint' in predictions:
@@ -577,29 +601,20 @@ cols.append('Closest_Model')
 cols.append('Checkpoint_Model_Name')
 
 df_pred = pd.DataFrame(predictions)[cols]
+os.makedirs("data", exist_ok=True)
 df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
-print("Saved: future_aqi_predictions.csv")
+print("Saved: data/future_aqi_predictions.csv")
 
+# Metrics
 y_true = df_pred['Actual_AQI'].values
 metrics_list = []
-checkpoint_name_in_file = "N/A"
-if os.path.exists(PERFORMANCE_FILE):
-    try:
-        with open(PERFORMANCE_FILE, "r") as f:
-            prev_performance = json.load(f)
-            checkpoint_name_in_file = prev_performance.get("model_name", "N/A")
-    except Exception as e:
-        print(f"Warning: Could not load historical name from {PERFORMANCE_FILE}: {e}")
-
 for name in [n for n in model_names if n in df_pred.columns]:
     y_pred = df_pred[name].values
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100
-    display_name = name
-    if name == 'best_checkpoint':
-        display_name = f"best_checkpoint ({checkpoint_name_in_file})"
+    display_name = f"{name} ({UNDERLYING_CHECKPOINT_MODEL})" if name == 'best_checkpoint' else name
     metrics_list.append({
         "Model": display_name,
         "MAE": round(mae, 3),
@@ -610,9 +625,10 @@ for name in [n for n in model_names if n in df_pred.columns]:
 
 df_metrics = pd.DataFrame(metrics_list)
 df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
-print("Saved: future_prediction_comparison.csv")
+print("Saved: data/future_prediction_comparison.csv")
 print("\n" + df_metrics.to_string(index=False))
 
+# Plotting
 print("Generating model comparison plots...")
 os.makedirs("model_comparison_plots", exist_ok=True)
 actual = df_pred['Actual_AQI'].values
@@ -622,9 +638,7 @@ for name in [n for n in model_names if n in df_pred.columns]:
     pred = df_pred[name].values
     plt.figure(figsize=(14, 6))
     plt.plot(dates, actual, label='Actual AQI (OWM)', color='black', linewidth=2.5, marker='o', markersize=3)
-    color = 'teal'
-    if name == 'best_checkpoint':
-        color = 'red'
+    color = 'red' if name == 'best_checkpoint' else 'teal'
     plt.plot(dates, pred, label=f'{name.upper()} Prediction', color=color, linewidth=2.5, alpha=0.9)
     plt.fill_between(dates, actual, pred, color='lightgray', alpha=0.5, label='Error Band')
     plt.title(f'96-Hour AQI Forecast: Actual vs {name.upper()}', fontsize=15, fontweight='bold')
