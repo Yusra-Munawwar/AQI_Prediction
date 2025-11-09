@@ -589,11 +589,25 @@ df_pred = pd.DataFrame(predictions)[cols]
 df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
 print("Saved: future_aqi_predictions.csv")
 
+
 # ----------------------------------------------------------------------
 # 7. METRICS → future_prediction_comparison.csv
 # ----------------------------------------------------------------------
 y_true = df_pred['Actual_AQI'].values
 metrics_list = []
+
+# --- 🎯 NEW LOGIC: Load the actual name of the checkpoint model ---
+checkpoint_name_in_file = "N/A"
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            # Retrieve the underlying model name (e.g., 'xgboost')
+            checkpoint_name_in_file = prev_performance.get("model_name", "N/A")
+    except Exception as e:
+        print(f"Warning: Could not load historical name from {PERFORMANCE_FILE}: {e}")
+# -------------------------------------------------------------------
+
 
 for name in [n for n in model_names if n in df_pred.columns]:
     y_pred = df_pred[name].values
@@ -601,8 +615,15 @@ for name in [n for n in model_names if n in df_pred.columns]:
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100 
+    
+    # --- 🎯 NEW LOGIC: Update the model name for the checkpoint row ---
+    display_name = name
+    if name == 'best_checkpoint':
+        # Append the actual model name to the 'best_checkpoint' label
+        display_name = f"best_checkpoint ({checkpoint_name_in_file})"
+        
     metrics_list.append({
-        "Model": name,
+        "Model": display_name,
         "MAE": round(mae, 3),
         "RMSE": round(rmse, 3),
         "R²": round(r2, 3),
