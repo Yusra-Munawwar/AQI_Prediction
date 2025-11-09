@@ -365,6 +365,17 @@ MODEL_PATHS = {
 # Add the historically best checkpoint model to the prediction list
 MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH 
 
+# --- 🎯 NEW CODE BLOCK: Load the underlying name of the best_checkpoint model ---
+UNDERLYING_CHECKPOINT_MODEL = "N/A"
+if os.path.exists(PERFORMANCE_FILE):
+    try:
+        with open(PERFORMANCE_FILE, "r") as f:
+            prev_performance = json.load(f)
+            # Retrieve the underlying model name (e.g., 'xgboost')
+            UNDERLYING_CHECKPOINT_MODEL = prev_performance.get("model_name", "N/A")
+    except Exception:
+        # If loading fails, keep it as "N/A"
+        pass
 
 print("\n" + "#"*80)
 print("PART 2: 96-HOUR AQI FORECAST")
@@ -577,18 +588,25 @@ abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - 
 closest_idx = np.argmin(abs_errors, axis=0)
 predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
 
+
 # ----------------------------------------------------------------------
 # 6. SAVE future_aqi_predictions.csv (EXACT COLUMNS)
 # ----------------------------------------------------------------------
 cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear']
+
+# 🎯 NEW: Insert the constant column containing the underlying checkpoint model name
+predictions['Checkpoint_Model_Name'] = UNDERLYING_CHECKPOINT_MODEL
+
 if 'best_checkpoint' in predictions:
     cols.append('best_checkpoint')
+    
 cols.append('Closest_Model')
+# 🎯 NEW: Add the new column to the output list
+cols.append('Checkpoint_Model_Name') 
 
 df_pred = pd.DataFrame(predictions)[cols]
 df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
 print("Saved: future_aqi_predictions.csv")
-
 
 # ----------------------------------------------------------------------
 # 7. METRICS → future_prediction_comparison.csv
