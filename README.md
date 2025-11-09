@@ -103,6 +103,7 @@ python scripts/training.py
 
 ### 5. **Run Dashboard**
 ```bash
+cd dashboard
 streamlit run app.py
 ```
 
@@ -138,11 +139,5 @@ All artifacts are **committed and pushed** automatically.
 4. Push and open a Pull Request
 
 ---
-
-
-
-> **"Breathe Easy, Forecast Smart"** – Powered by data, driven by code.  
-
---- 
 
 *Last updated: November 09, 2025*
