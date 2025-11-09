@@ -17,16 +17,15 @@ import lightgbm as lgb
 import catboost as cb
 from datetime import datetime as dt_datetime
 import time
+from xgboost import DMatrix
 
 def utcfromtimestamp(ts):
     return pd.Timestamp(dt_datetime.utcfromtimestamp(ts), tz='UTC')
 
-# --- CONFIGURATION ---
-# Note: OWM_API_KEY and HOPSWORKS_API_KEY must be set in the environment
-API_KEY = os.getenv("OWM_API_KEY") 
-LAT = 24.8607    # Karachi latitude
-LON = 67.0011    # Karachi longitude
-HISTORIC_PATH = "data/2years_features_clean.csv" 
+API_KEY = os.getenv("OWM_API_KEY")
+LAT = 24.8607  # Karachi latitude
+LON = 67.0011  # Karachi longitude
+HISTORIC_PATH = "data/2years_features_clean.csv"
 PERFORMANCE_FILE = "model_artifacts/best_model_performance.json"
 CHECKPOINT_MODEL_PATH = "model_artifacts/best_model.pkl"
 
@@ -37,12 +36,9 @@ print("PART 1: FETCH TRAINING DATA")
 print("="*80)
 
 def fetch_training_data():
-    """Fetches training data from Hopsworks Feature Store or falls back to CSV."""
     try:
-        
         project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
         fs = project.get_feature_store()
-        # Ensure the feature group name and version are correct
         fg = fs.get_feature_group(name="aqi_features", version=4)
         cols = ['datetime_utc', 'us_aqi'] + [
             'pm2_5', 'pm10', 'co', 'no2', 'so2',
@@ -57,8 +53,7 @@ def fetch_training_data():
         return df
     except Exception as e:
         print(f"Hopsworks failed: {e}")
-        # Fallback to local historic CSV data
-        df = pd.read_csv(HISTORIC_PATH) 
+        df = pd.read_csv(HISTORIC_PATH)
         df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
         print(f"Fallback CSV: {df.shape}")
         return df
@@ -74,40 +69,37 @@ SELECTED_FEATURES = [
     'hour_sin', 'hour_cos'
 ]
 
-# Prepare data for time series split
 X = df[SELECTED_FEATURES].fillna(0).values
 y = df['us_aqi'].values
 
 n = len(X)
 train_end = int(0.7 * n)
-val_end    = int(0.8 * n)
+val_end = int(0.8 * n)
 
 X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
 y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
-# Standardize data for linear models
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
-X_val_scaled   = scaler.transform(X_val)
-X_test_scaled  = scaler.transform(X_test)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
 
 os.makedirs("model_artifacts", exist_ok=True)
 joblib.dump(scaler, "model_artifacts/scaler.pkl")
 
 def calc_metrics(y_true, y_pred, name=""):
-    """Calculates and prints standard regression metrics."""
-    mae  = mean_absolute_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2   = r2_score(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
     mask = y_true != 0
     mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if np.any(mask) else np.nan
     print(f"{name:18} MAE: {mae:6.3f} | RMSE: {rmse:6.3f} | R²: {r2:6.3f} | MAPE: {mape:6.2f}%")
     return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}
 
-
 tscv = TimeSeriesSplit(n_splits=5)
-models      = {}
-cv_scores   = {}
+
+models = {}
+cv_scores = {}
 all_metrics = {"train": {}, "val": {}, "test": {}, "cv_mae": {}}
 
 print("\n" + "="*80)
@@ -115,88 +107,166 @@ print("TRAINING & SAVING ALL MODELS")
 print("="*80)
 
 def train_with_cv(model, name, use_scaled=False):
-    """Trains a model with TimeSeries CV and calculates final metrics."""
     X_tr = X_train_scaled if use_scaled else X_train
-    X_va = X_val_scaled   if use_scaled else X_val
-    X_te = X_test_scaled    if use_scaled else X_test
-    
+    X_va = X_val_scaled if use_scaled else X_val
+    X_te = X_test_scaled if use_scaled else X_test
+
+    # --- 5-fold CV ---
     cv_mae = []
-    # 1. Cross-Validation on Training Set
     for tr_idx, val_idx in tscv.split(X_tr):
         X_f_tr, X_f_va = X_tr[tr_idx], X_tr[val_idx]
         y_f_tr, y_f_va = y_train[tr_idx], y_train[val_idx]
 
-        # Handle specific models with custom fit behavior (like early stopping)
         if name == "xgboost":
-            m = xgb.XGBRegressor(**model.get_params())
-            m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], verbose=False)
+            dtrain = xgb.DMatrix(X_f_tr, label=y_f_tr, feature_names=SELECTED_FEATURES)
+            dval = xgb.DMatrix(X_f_va, label=y_f_va, feature_names=SELECTED_FEATURES)
+            params = model.get_xgb_params() if hasattr(model, "get_xgb_params") else model.get_params()
+            bst = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=model.n_estimators,
+                evals=[(dval, "eval")],
+                early_stopping_rounds=50,
+                verbose_eval=False
+            )
+            pred = bst.predict(dval)
         elif name == "lightgbm":
             m = lgb.LGBMRegressor(**model.get_params())
-            m.fit(X_f_tr, y_f_tr, eval_set=[(X_f_va, y_f_va)], 
-                              callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)])
+            m.fit(X_f_tr, y_f_tr,
+                  eval_set=[(X_f_va, y_f_va)],
+                  callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
+            pred = m.predict(X_f_va)
         else:
             m = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
             m.fit(X_f_tr, y_f_tr)
+            pred = m.predict(X_f_va)
 
-        pred = m.predict(X_f_va)
         cv_mae.append(mean_absolute_error(y_f_va, pred))
 
     cv_mae_mean = np.mean(cv_mae)
     print(f"{name:12} CV MAE: {cv_mae_mean:.3f}")
 
-    # 2. Final Fit on entire Training Set
-    final_model = model
-    final_model.fit(X_tr, y_train)
-    
-    # 3. Evaluation on Train, Val, Test sets
-    pred_train = final_model.predict(X_tr)
-    pred_val   = final_model.predict(X_va)
-    pred_test  = final_model.predict(X_te)
+    # --- Final fit on full train ---
+    if name == "xgboost":
+        dtrain_full = xgb.DMatrix(X_tr, label=y_train, feature_names=SELECTED_FEATURES)
+        dval_full = xgb.DMatrix(X_va, label=y_val, feature_names=SELECTED_FEATURES)
+        params = model.get_xgb_params() if hasattr(model, "get_xgb_params") else model.get_params()
+        final_model = xgb.train(
+            params,
+            dtrain_full,
+            num_boost_round=model.n_estimators,
+            evals=[(dval_full, "eval")],
+            early_stopping_rounds=50,
+            verbose_eval=False
+        )
+    elif name == "lightgbm":
+        final_model = lgb.LGBMRegressor(**model.get_params())
+        final_model.fit(
+            X_tr, y_train,
+            eval_set=[(X_va, y_val)],
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+        )
+    else:
+        final_model = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
+        final_model.fit(X_tr, y_train)
 
+    # --- Predictions ---
+    if name == "xgboost":
+        pred_train = final_model.predict(xgb.DMatrix(X_tr, feature_names=SELECTED_FEATURES))
+        pred_val = final_model.predict(xgb.DMatrix(X_va, feature_names=SELECTED_FEATURES))
+        pred_test = final_model.predict(xgb.DMatrix(X_te, feature_names=SELECTED_FEATURES))
+    else:
+        pred_train = final_model.predict(X_tr)
+        pred_val = final_model.predict(X_va)
+        pred_test = final_model.predict(X_te)
+
+    # Store metrics
     all_metrics['train'][name] = calc_metrics(y_train, pred_train, f"{name} Train")
-    all_metrics['val'][name]   = calc_metrics(y_val,   pred_val,   f"{name} Val")
-    all_metrics['test'][name]  = calc_metrics(y_test,  pred_test,  f"{name} Test")
+    all_metrics['val'][name] = calc_metrics(y_val, pred_val, f"{name} Val")
+    all_metrics['test'][name] = calc_metrics(y_test, pred_test, f"{name} Test")
     all_metrics['cv_mae'][name] = cv_mae_mean
 
+    # Save this model
     model_path = f"model_artifacts/model_{name}.pkl"
     joblib.dump(final_model, model_path)
+    print(f"Saved: {model_path}")
 
+    # Store in dict
     models[name] = final_model
     cv_scores[name] = cv_mae_mean
-    return models, cv_scores
 
-# TRAINING ALL MODELS 
-
+# TRAINING ALL MODELS
 print("1. XGBoost")
-xgb_model = xgb.XGBRegressor(n_estimators=400, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
-models, cv_scores = train_with_cv(xgb_model, "xgboost")
+xgb_model = xgb.XGBRegressor(
+    n_estimators=300,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.7,
+    colsample_bytree=0.7,
+    reg_alpha=1.0,
+    reg_lambda=2.0,
+    random_state=42,
+    n_jobs=-1
+)
+train_with_cv(xgb_model, "xgboost")
 
 print("2. LightGBM")
-lgb_model = lgb.LGBMRegressor(n_estimators=1000, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1)
-models, cv_scores = train_with_cv(lgb_model, "lightgbm")
+lgb_model = lgb.LGBMRegressor(
+    n_estimators=500,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.7,
+    colsample_bytree=0.7,
+    reg_alpha=1.0,
+    reg_lambda=2.0,
+    random_state=42,
+    n_jobs=-1
+)
+train_with_cv(lgb_model, "lightgbm")
 
 print("3. CatBoost")
-cb_model = cb.CatBoostRegressor(iterations=500, depth=5, learning_rate=0.05, l2_leaf_reg=3, random_seed=42, verbose=False)
-models, cv_scores = train_with_cv(cb_model, "catboost")
+cb_model = cb.CatBoostRegressor(
+    iterations=500,
+    depth=5,
+    learning_rate=0.05,
+    l2_leaf_reg=3,
+    random_seed=42,
+    verbose=False
+)
+train_with_cv(cb_model, "catboost")
 
 print("4. Random Forest")
-rf_model = RandomForestRegressor(n_estimators=300, max_depth=8, min_samples_split=20, min_samples_leaf=10, random_state=42, n_jobs=-1)
-models, cv_scores = train_with_cv(rf_model, "rf")
+rf_model = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=8,
+    min_samples_split=20,
+    min_samples_leaf=10,
+    random_state=42,
+    n_jobs=-1
+)
+train_with_cv(rf_model, "rf")
 
 print("5. Gradient Boosting")
-gb_model = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8, min_samples_split=20, min_samples_leaf=10, random_state=42)
-models, cv_scores = train_with_cv(gb_model, "gb")
+gb_model = GradientBoostingRegressor(
+    n_estimators=300,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    min_samples_split=20,
+    min_samples_leaf=10,
+    random_state=42
+)
+train_with_cv(gb_model, "gb")
 
-print("6. Ridge (Requires Scaling)")
+print("6. Ridge")
 ridge_model = Ridge(alpha=10.0, random_state=42)
-models, cv_scores = train_with_cv(ridge_model, "ridge", use_scaled=True)
+train_with_cv(ridge_model, "ridge", use_scaled=True)
 
-print("7. Linear (Requires Scaling)")
+print("7. Linear")
 lr_model = LinearRegression()
-models, cv_scores = train_with_cv(lr_model, "linear", use_scaled=True)
+train_with_cv(lr_model, "linear", use_scaled=True)
 
-# BEST MODEL CHECKPOINTING LOGIC
-
+# BEST MODEL (WITH CHECKPOINT LOGIC)
 best_name_cv = min(cv_scores, key=cv_scores.get)
 best_mod_cv = models[best_name_cv]
 new_cv_mae = cv_scores[best_name_cv]
@@ -206,27 +276,28 @@ print("\n" + "="*80)
 print(f"CURRENT RUN BEST (CV): {best_name_cv.upper()} | CV MAE: {new_cv_mae:.3f}")
 print("="*80)
 
-# Evaluate the current best on the Test set for checkpoint logging
 X_test_fin = X_test_scaled if best_name_cv in ["ridge", "linear"] else X_test
-y_test_pred = best_mod_cv.predict(X_test_fin)
+if best_name_cv == "xgboost":
+    y_test_pred = best_mod_cv.predict(xgb.DMatrix(X_test_fin, feature_names=SELECTED_FEATURES))
+else:
+    y_test_pred = best_mod_cv.predict(X_test_fin)
 new_test_metrics = calc_metrics(y_test, y_test_pred, "NEW TEST METRICS")
 new_test_mae = new_test_metrics['mae']
 
-# CHECKPOINT LOGIC (PRIORITIZING CV MAE) 
+# CHECKPOINT LOGIC (PRIORITIZING CV MAE)
 historical_best_cv_mae = float('inf')
-historical_best_name = "N/A" 
-current_best_mae_test_only = float('inf') 
-current_best_name_test_only = "N/A"        
+historical_best_name = "N/A"
+current_best_mae_test_only = float('inf')
+current_best_name_test_only = "N/A"
 
 if os.path.exists(PERFORMANCE_FILE):
     try:
         with open(PERFORMANCE_FILE, "r") as f:
             prev_performance = json.load(f)
-            historical_best_cv_mae = prev_performance.get("cv_mae", float('inf')) 
+            historical_best_cv_mae = prev_performance.get("cv_mae", float('inf'))
             historical_best_name = prev_performance.get("model_name", "N/A")
             current_best_mae_test_only = prev_performance.get("test_mae", float('inf'))
-            current_best_name_test_only = prev_performance.get("model_name", "N/A") 
-            
+            current_best_name_test_only = prev_performance.get("model_name", "N/A")
             print(f"Historical Best CV MAE: {historical_best_cv_mae:.3f} ({historical_best_name})")
     except Exception as e:
         print(f"Error loading {PERFORMANCE_FILE}: {e}. Starting fresh checkpoint.")
@@ -235,21 +306,18 @@ else:
 
 if new_cv_mae < historical_best_cv_mae:
     print(f"✅ New model ({best_name_cv.upper()}) is more robust (CV MAE {new_cv_mae:.3f} < {historical_best_cv_mae:.3f}). Saving checkpoint.")
-    
-    # Save the new best model and update performance file
     joblib.dump(best_mod_cv, CHECKPOINT_MODEL_PATH)
     print(f"NEW BEST Model SAVED: {CHECKPOINT_MODEL_PATH}")
     
     performance_data = {
         "model_name": best_name_cv,
         "cv_mae": new_cv_mae,
-        "test_mae": new_test_mae, # Keep test MAE for reference
+        "test_mae": new_test_mae,
         "test_r2": new_test_metrics['r2'],
         "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
     }
     with open(PERFORMANCE_FILE, "w") as f:
         json.dump(performance_data, f, indent=2)
-
     is_new_best = True
     final_best_name = best_name_cv
     final_test_metrics = new_test_metrics
@@ -257,30 +325,25 @@ else:
     print(f"❌ Current CV best ({best_name_cv.upper()} MAE {new_cv_mae:.3f}) is not better than the historical best (MAE {historical_best_cv_mae:.3f}).")
     print(f"Keeping the previously saved model: {historical_best_name.upper()}")
     print(f"Keeping the previously saved {CHECKPOINT_MODEL_PATH} checkpoint.")
-    
     is_new_best = False
-    final_best_name = historical_best_name 
-    # Use the current run's test metrics for the summary, but keep the historical name
-    final_test_metrics = new_test_metrics 
+    final_best_name = historical_best_name
+    final_test_metrics = new_test_metrics
 
-# Determine the name of the model currently loaded in the checkpoint
-current_checkpoint_name = final_best_name 
+current_checkpoint_name = final_best_name
 
 print("\n" + "="*80)
 print("CHECKPOINT COMPLETE")
 print("="*80)
 
-
 joblib.dump(SELECTED_FEATURES, "model_artifacts/selected_features.pkl")
 
-# Save detailed metrics for the current run
 with open("model_artifacts/metrics_current_run.json", "w") as f:
     json.dump({
-        "trained_best_model": best_name_cv, 
+        "trained_best_model": best_name_cv,
         "new_test_metrics": new_test_metrics,
         "cv_mae": cv_scores,
         "test_mae_all": {name: all_metrics['test'][name]['mae'] for name in models},
-        "historical_best_cv_mae": historical_best_cv_mae, 
+        "historical_best_cv_mae": historical_best_cv_mae,
         "is_new_historical_best": is_new_best,
         "features": SELECTED_FEATURES,
         "scaler_needed": best_name_cv in ["ridge", "linear"],
@@ -293,30 +356,26 @@ print(f"Current run metrics saved to model_artifacts/metrics_current_run.json")
 print("\n" + "="*80)
 print("TRAINING COMPLETE – CHECKPOINT STATUS")
 print("="*80)
-# Summary uses the correct names/MAEs based on the checkpoint logic
-print(f"Best Model from Current Run : {best_name_cv.upper()} (CV MAE: {new_cv_mae:.3f})")
-print(f"Current Run Test MAE          : {new_test_metrics['mae']:.3f}")
-print(f"Historical Best Test MAE    : {current_best_mae_test_only:.3f} ({current_best_name_test_only})") 
-print(f"STATUS                      : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
-print(f"Saved Checkpoint Model Name : {current_checkpoint_name.upper()}")
-print(f"Saved Checkpoint Location   : {CHECKPOINT_MODEL_PATH}")
+print(f"Best Model from Current Run : {best_name_cv.upper()}")
+print(f"Current Run Test MAE : {new_test_metrics['mae']:.3f}")
+print(f"Historical Best Test MAE : {current_best_mae_test_only:.3f} ({current_best_name_test_only})")
+print(f"STATUS : {'✅ PROMOTED NEW BEST' if is_new_best else '❌ KEPT OLD BEST'}")
+print(f"Saved Checkpoint Location : {CHECKPOINT_MODEL_PATH}")
 print("="*80)
 
 # PART 2: FORECASTING
-
 MODEL_PATHS = {
-    "xgboost":    "model_artifacts/model_xgboost.pkl",
-    "lightgbm":  "model_artifacts/model_lightgbm.pkl",
-    "catboost":  "model_artifacts/model_catboost.pkl",
-    "rf":        "model_artifacts/model_rf.pkl",
-    "gb":        "model_artifacts/model_gb.pkl",
-    "ridge":     "model_artifacts/model_ridge.pkl",
-    "linear":    "model_artifacts/model_linear.pkl"
+    "xgboost": "model_artifacts/model_xgboost.pkl",
+    "lightgbm": "model_artifacts/model_lightgbm.pkl",
+    "catboost": "model_artifacts/model_catboost.pkl",
+    "rf": "model_artifacts/model_rf.pkl",
+    "gb": "model_artifacts/model_gb.pkl",
+    "ridge": "model_artifacts/model_ridge.pkl",
+    "linear": "model_artifacts/model_linear.pkl"
 }
 
-MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH 
+MODEL_PATHS['best_checkpoint'] = CHECKPOINT_MODEL_PATH
 
-# Retrieve the name of the model currently saved in the checkpoint file for logging
 UNDERLYING_CHECKPOINT_MODEL = "N/A"
 if os.path.exists(PERFORMANCE_FILE):
     try:
@@ -328,113 +387,75 @@ if os.path.exists(PERFORMANCE_FILE):
 
 print("\n" + "#"*80)
 print("PART 2: 96-HOUR AQI FORECAST")
-print(f"Checkpoint Model Used for Forecast: {UNDERLYING_CHECKPOINT_MODEL.upper()}")
 print("#"*80)
 
-# Load artifacts
-try:
-    scaler = joblib.load("model_artifacts/scaler.pkl")
-    SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
-except Exception as e:
-    print(f"Error loading necessary artifacts (scaler/features): {e}. Exiting forecast.")
-    exit(1)
+scaler = joblib.load("model_artifacts/scaler.pkl")
+SELECTED_FEATURES = joblib.load("model_artifacts/selected_features.pkl")
 
 models = {}
 for name, path in MODEL_PATHS.items():
     try:
         if name == 'best_checkpoint' and not os.path.exists(path):
-             print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
-             continue
+            print(f"Warning: {path} not found (first run?). Skipping checkpoint prediction.")
+            continue
         models[name] = joblib.load(path)
     except Exception as e:
         print(f"Failed to load {name} from {path}: {e}")
 
 print(f"Loaded {len(models)} models for prediction.")
 
-# --- EPA AQI Breakpoints (Required for calculating 'Actual_AQI' from OWM components) ---
 breakpoints = {
     'pm2_5': [(0.0, 0, 9.0, 50), (9.1, 51, 35.4, 100), (35.5, 101, 55.4, 150),
               (55.5, 151, 125.4, 200), (125.5, 201, 225.4, 300), (225.5, 301, 500.4, 500)],
-    'pm10':  [(0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
+    'pm10': [(0, 0, 54, 50), (55, 51, 154, 100), (155, 101, 254, 150),
               (255, 151, 354, 200), (355, 201, 424, 300), (425, 301, 504, 400),
               (505, 401, 604, 500)],
-    'o3':    [(0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
+    'o3': [(0.000, 0, 0.054, 50), (0.055, 51, 0.070, 100), (0.071, 101, 0.085, 150),
               (0.086, 151, 0.105, 200), (0.106, 201, 0.200, 300), (0.201, 301, 0.404, 400),
               (0.405, 401, 0.604, 500)],
-    'no2':   [(0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
+    'no2': [(0.000, 0, 0.053, 50), (0.054, 51, 0.100, 100), (0.101, 101, 0.360, 150),
               (0.361, 151, 0.649, 200), (0.650, 201, 0.854, 300), (0.855, 301, 1.049, 400),
               (1.050, 401, 2.104, 500)],
-    'so2':   [(0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
+    'so2': [(0.000, 0, 0.004, 50), (0.005, 51, 0.009, 100), (0.010, 101, 0.014, 150),
               (0.015, 151, 0.035, 200), (0.036, 201, 0.075, 300), (0.076, 301, 0.185, 400),
               (0.186, 401, 0.604, 500)],
-    'co':    [(0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
+    'co': [(0.0, 0, 4.4, 50), (4.5, 51, 9.4, 100), (9.5, 101, 12.4, 150),
               (12.5, 151, 15.4, 200), (15.5, 201, 30.4, 300), (30.5, 301, 50.4, 500)]
 }
 
 def to_epa_units(c, pollutant):
-    """Converts OpenWeatherMap units (ug/m3 or mg/m3) to EPA standard units (ppm/ppb) for AQI calculation."""
     if pd.isna(c) or c <= 0: return 0.0
-    # OWM provides CO in mg/m3. EPA standard is ppm. Conversion factor is 1145 mg/m3 per ppm.
-    if pollutant == 'co':    return c / 1145.0
-    # OWM provides O3 in ug/m3. EPA standard is ppm. Conversion factor: 1960.6 ug/m3 per ppm (at 25C)
-    if pollutant == 'o3':    return c / 1960.6
-    # OWM provides NO2 in ug/m3. EPA standard is ppb. Conversion factor: 1.8811 ug/m3 per ppb
-    if pollutant == 'no2':   return c / 1881.1
-    # OWM provides SO2 in ug/m3. EPA standard is ppb. Conversion factor: 2.620 ug/m3 per ppb
-    if pollutant == 'so2':   return c / 2620.0
-    # PMs (pm2_5, pm10) are already in ug/m3, which is the EPA standard for the concentration breakpoints.
+    if pollutant == 'co': return c / 1145.0
+    if pollutant == 'o3': return c / 1960.6
+    if pollutant == 'no2': return c / 1881.1
+    if pollutant == 'so2': return c / 2620.0
     return c
 
 def calc_sub_aqi(c, pollutant):
-    """Calculates the individual pollutant's AQI score (sub-AQI)."""
     c_epa = to_epa_units(c, pollutant)
     bps = breakpoints.get(pollutant, [])
     if c_epa <= 0: return 0
     prev_high = -np.inf
-    
     for c_low, i_low, c_high, i_high in bps:
         if c_epa > prev_high and c_epa <= c_high:
-            # Linear interpolation: I_i = [(I_high - I_low) / (C_high - C_low)] * (C_i - C_low) + I_low
             return i_low + ((i_high - i_low) * (c_epa - c_low)) / (c_high - c_low)
         prev_high = c_high
-    # If concentration exceeds the highest breakpoint
     return 500
 
 def calc_us_aqi(row):
-    """Calculates the final US AQI as the maximum of all sub-AQI scores."""
     pollutants = ['pm2_5', 'pm10', 'o3', 'no2', 'so2', 'co']
-    # Note: OWM includes O3, which is necessary for calculating the official 'Actual_AQI'
     sub_aqis = [calc_sub_aqi(row.get(p, 0), p) for p in pollutants]
     return max(sub_aqis)
 
 def get_pollution_forecast(lat, lon, api_key):
-    """Fetches the 96-hour air pollution forecast from OpenWeatherMap."""
     if not api_key:
-        raise ValueError("OWM_API_KEY is missing or empty! Cannot fetch live data.")
+        raise ValueError("OWM_API_KEY is missing or empty!")
     
     url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={api_key}"
     print(f"Requesting forecast from: {url}")
     
     try:
-        # Use a retry loop with exponential backoff for robustness
-        max_retries = 3
-        retry_delay = 1
-        resp = None
-        for attempt in range(max_retries):
-            try:
-                resp = requests.get(url, timeout=10)
-                break # Success
-            except requests.exceptions.RequestException as req_e:
-                if attempt < max_retries - 1:
-                    print(f"Request failed (Attempt {attempt+1}/{max_retries}): {req_e}. Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    raise req_e
-
-        if resp is None:
-             raise Exception("Failed to get response after multiple retries.")
-             
+        resp = requests.get(url, timeout=10)
         print(f"API Response Status: {resp.status_code}")
         
         if resp.status_code == 401:
@@ -454,18 +475,17 @@ def get_pollution_forecast(lat, lon, api_key):
             comp = item['components']
             rows.append({
                 'datetime_utc': dt,
-                # OWM pollutants are in: pm2_5/pm10 (ug/m3), co (mg/m3), no2/o3/so2 (ug/m3)
-                'pm2_5': comp.get('pm2_5', 0), 
-                'pm10': comp.get('pm10', 0), 
+                'pm2_5': comp.get('pm2_5', 0),
+                'pm10': comp.get('pm10', 0),
                 'co': comp.get('co', 0),
-                'no2': comp.get('no2', 0), 
-                'o3': comp.get('o3', 0), 
+                'no2': comp.get('no2', 0),
+                'o3': comp.get('o3', 0),
                 'so2': comp.get('so2', 0)
             })
         df = pd.DataFrame(rows)
         df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
         print(f"Successfully fetched {len(df)} forecast hours.")
-        return df.head(96) # Cap at 96 hours (4 days)
+        return df.head(96)
     
     except requests.exceptions.Timeout:
         raise ValueError("Request to OpenWeatherMap timed out.")
@@ -477,19 +497,15 @@ def get_pollution_forecast(lat, lon, api_key):
 
 print("Fetching 96-hour forecast...")
 try:
-    # Fetch forecast data and calculate the EPA-official AQI from the raw components
     df_forecast = get_pollution_forecast(LAT, LON, API_KEY)
     df_forecast['Actual_AQI'] = df_forecast.apply(calc_us_aqi, axis=1).round().astype(int).clip(0, 500)
 except Exception as e:
-    # Error handling and fallback if API call fails
     print(f"FORECAST FAILED: {e}")
     os.makedirs("data", exist_ok=True)
-    # Create dummy dataframes to prevent downstream errors
     dummy = pd.DataFrame({
         'datetime': [pd.Timestamp.now(tz='UTC')], 'Actual_AQI': [0],
         'xgboost': [0], 'lightgbm': [0], 'catboost': [0], 'rf': [0], 'gb': [0],
-        'ridge': [0], 'linear': [0], 'Closest_Model': ['error'], 
-        'Checkpoint_Model_Name': ['error']
+        'ridge': [0], 'linear': [0], 'Closest_Model': ['error']
     })
     if os.path.exists(CHECKPOINT_MODEL_PATH):
         dummy['best_checkpoint'] = [0]
@@ -498,99 +514,99 @@ except Exception as e:
     print("Pipeline completed with forecast fallback.")
     exit(0)
 
-# Load the last few historical points to compute rolling features for the forecast
 print(f"Loading historic data from {HISTORIC_PATH}...")
 df_hist = pd.read_csv(HISTORIC_PATH)
-# Use a robust parsing method, though ISO8601 is expected from the training part
-df_hist['datetime_utc'] = pd.to_datetime(df_hist['datetime_utc'], utc=True, errors='coerce') 
-df_hist = df_hist.dropna(subset=['datetime_utc'])
+df_hist['datetime_utc'] = pd.to_datetime(df_hist['datetime_utc'], format='ISO8601', utc=True)
 df_hist = df_hist.sort_values('datetime_utc').reset_index(drop=True)
 last_3 = df_hist.tail(3)
 
 def build_features(df_fc, last_hist):
-    """Generates the same features used in training on the forecast data."""
     df = df_fc.copy()
-    
-    # Time-based features
     df['hour'] = df['datetime_utc'].dt.hour
     df['month'] = df['datetime_utc'].dt.month
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
-    # Derived features
     df['total_pm'] = df['pm2_5'] + df['pm10']
-    df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2'] # Note: O3 is only used here, not in the trained model features
+    df['total_gases'] = df['co'] + df['no2'] + df['o3'] + df['so2']
     df['no2_o3_ratio'] = df['no2'] / (df['o3'] + 1e-6)
     df['pm2_5_co_interaction'] = df['pm2_5'] * df['co']
 
-    # Rolling window features (requires lookback into historic data)
-    combined = pd.concat([last_hist[['pm2_5', 'pm10', 'co']].tail(2), df[['pm2_5', 'pm10', 'co']]], ignore_index=True)
-    
-    # Calculate rolling features over the combined data, then slice back to only the forecast rows
-    # combined length: 2 (hist) + 96 (fc) = 98 rows. Start index for fc is 2.
-    df['pm2_5_rolling_3h'] = combined['pm2_5'].rolling(3, min_periods=1).mean().iloc[2:].values
-    df['pm10_rolling_3h']  = combined['pm10'].rolling(3, min_periods=1).mean().iloc[2:].values
-    df['co_rolling_3h']    = combined['co'].rolling(3, min_periods=1).mean().iloc[2:].values
+    combined = pd.concat([last_hist[['pm2_5', 'pm10', 'co']], df[['pm2_5', 'pm10', 'co']]], ignore_index=True)
+    df['pm2_5_rolling_3h'] = combined['pm2_5'].rolling(3, min_periods=1).mean().iloc[-96:].values
+    df['pm10_rolling_3h'] = combined['pm10'].rolling(3, min_periods=1).mean().iloc[-96:].values
+    df['co_rolling_3h'] = combined['co'].rolling(3, min_periods=1).mean().iloc[-96:].values
 
-    # Lag features (if used, though not in SELECTED_FEATURES)
     if 'us_aqi' in last_hist.columns:
         df['us_aqi_lag1'] = last_hist['us_aqi'].iloc[-1]
     else:
-        df['us_aqi_lag1'] = 0 
+        df['us_aqi_lag1'] = 0
         
     df = df.drop(columns=['hour', 'month'], errors='ignore')
     return df
 
 df_fc_feat = build_features(df_forecast, last_3)
-# Prepare feature matrix for prediction
-X = df_fc_feat[SELECTED_FEATURES].fillna(0).values
+X_df = df_fc_feat[SELECTED_FEATURES].fillna(0)
+X = X_df.values
+
 predictions = {'datetime': df_fc_feat['datetime_utc'], 'Actual_AQI': df_fc_feat['Actual_AQI']}
 model_names = list(models.keys())
 
-# Generate predictions for all models
 for name in model_names:
-    model = models[name]    
-    
-    # Determine if scaling is needed for the current model prediction
-    is_linear_model = name in ["ridge", "linear"]
-    is_checkpoint_linear = name == "best_checkpoint" and UNDERLYING_CHECKPOINT_MODEL in ["ridge", "linear"]
-    
-    if is_linear_model or is_checkpoint_linear:
-        X_input = scaler.transform(X)
-    else:
-        X_input = X
+    print(f"Predicting with {name}...")
+    model = models[name]
 
-    pred = model.predict(X_input)
-    # Clip predictions to realistic AQI range [0, 500]
-    pred = np.clip(pred.round().astype(int), 0, 500)
-    predictions[name] = pred
+    try:
+        if name == "xgboost":
+            # Convert to DMatrix with feature names
+            dmat = DMatrix(X_df, feature_names=SELECTED_FEATURES)
+            pred = model.predict(dmat)
+        elif name in ["lightgbm", "catboost"]:
+            # Use DataFrame to keep feature names
+            pred = model.predict(X_df)
+        elif name in ["ridge", "linear"]:
+            # Scale for linear models
+            pred = model.predict(scaler.transform(X_df))
+        elif name == "best_checkpoint" and current_checkpoint_name in ["ridge", "linear"]:
+            # Handle checkpoint model if it's linear
+            pred = model.predict(scaler.transform(X_df))
+        elif name == "best_checkpoint" and current_checkpoint_name == "xgboost":
+            # Handle checkpoint model if it's XGBoost
+            dmat = DMatrix(X_df, feature_names=SELECTED_FEATURES)
+            pred = model.predict(dmat)
+        else:
+            # Tree ensembles (RF, GB) or checkpoint
+            pred = model.predict(X_df)
 
-# Determine which model was closest to the 'Actual_AQI' at each hour (excluding the checkpoint)
+        # Clip predictions
+        pred = np.clip(np.round(pred).astype(int), 0, 500)
+        predictions[name] = pred
+    except Exception as e:
+        print(f"Prediction error for {name}: {e}")
+        predictions[name] = np.full(len(X_df), np.nan)
+
+# Closest Model
 model_names_for_error = [name for name in model_names if name != 'best_checkpoint']
 abs_errors = np.abs(np.array([predictions[m] for m in model_names_for_error]) - predictions['Actual_AQI'].values)
 closest_idx = np.argmin(abs_errors, axis=0)
 predictions['Closest_Model'] = [model_names_for_error[i] for i in closest_idx]
 
-# Final DataFrame assembly
 cols = ['datetime', 'Actual_AQI', 'xgboost', 'lightgbm', 'catboost', 'rf', 'gb', 'ridge', 'linear']
 predictions['Checkpoint_Model_Name'] = UNDERLYING_CHECKPOINT_MODEL
-
 if 'best_checkpoint' in predictions:
     cols.append('best_checkpoint')
-    
+   
 cols.append('Closest_Model')
-cols.append('Checkpoint_Model_Name') 
-
+cols.append('Checkpoint_Model_Name')
 df_pred = pd.DataFrame(predictions)[cols]
 df_pred.to_csv("data/future_aqi_predictions.csv", index=False)
-print("Saved: future_aqi_predictions.csv")
+print("Saved: data/future_aqi_predictions.csv")
 
-# Calculate prediction comparison metrics for the forecast period
 y_true = df_pred['Actual_AQI'].values
 metrics_list = []
-checkpoint_name_in_file = "N/A"
 
+checkpoint_name_in_file = "N/A"
 if os.path.exists(PERFORMANCE_FILE):
     try:
         with open(PERFORMANCE_FILE, "r") as f:
@@ -604,13 +620,12 @@ for name in [n for n in model_names if n in df_pred.columns]:
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
-    # MAPE calculation adjusted for potential zero division by adding a small epsilon
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100 
-    
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100
+   
     display_name = name
     if name == 'best_checkpoint':
         display_name = f"best_checkpoint ({checkpoint_name_in_file})"
-        
+       
     metrics_list.append({
         "Model": display_name,
         "MAE": round(mae, 3),
@@ -621,12 +636,10 @@ for name in [n for n in model_names if n in df_pred.columns]:
 
 df_metrics = pd.DataFrame(metrics_list)
 df_metrics.to_csv("data/future_prediction_comparison.csv", index=False)
-print("Saved: future_prediction_comparison.csv")
+print("Saved: data/future_prediction_comparison.csv")
 print("\n" + df_metrics.to_string(index=False))
 
-# --- Plotting ---
 print("Generating model comparison plots...")
-
 os.makedirs("model_comparison_plots", exist_ok=True)
 
 actual = df_pred['Actual_AQI'].values
@@ -634,17 +647,17 @@ dates = df_pred['datetime']
 
 for name in [n for n in model_names if n in df_pred.columns]:
     pred = df_pred[name].values
-    
+   
     plt.figure(figsize=(14, 6))
     plt.plot(dates, actual, label='Actual AQI (OWM)', color='black', linewidth=2.5, marker='o', markersize=3)
-    
+   
     color = 'teal'
     if name == 'best_checkpoint':
         color = 'red'
-        
+       
     plt.plot(dates, pred, label=f'{name.upper()} Prediction', color=color, linewidth=2.5, alpha=0.9)
     plt.fill_between(dates, actual, pred, color='lightgray', alpha=0.5, label='Error Band')
-    
+   
     plt.title(f'96-Hour AQI Forecast: Actual vs {name.upper()}', fontsize=15, fontweight='bold')
     plt.xlabel('Time (UTC)', fontsize=12)
     plt.ylabel('US AQI', fontsize=12)
@@ -652,10 +665,9 @@ for name in [n for n in model_names if n in df_pred.columns]:
     plt.grid(alpha=0.3)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    
+   
     safe_name = name.replace(" ", "_")
     plt.savefig(f"model_comparison_plots/{safe_name}_vs_actual.png", dpi=200, bbox_inches='tight')
-    # plt.show()
     plt.close()
 
 print(f"{len([n for n in model_names if n in df_pred.columns])} plots saved in: model_comparison_plots/")
