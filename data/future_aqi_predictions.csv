@@ -1,7 +1,6 @@
 datetime,Actual_AQI,xgboost,lightgbm,catboost,rf,gb,ridge,linear,best_checkpoint,Closest_Model,Checkpoint_Model_Name
-2026-08-26 04:00:00+00:00,65,72,70,73,68,68,68,67,70,linear,xgboost
-2026-08-26 05:00:00+00:00,66,68,68,69,68,68,69,67,67,linear,xgboost
-2026-08-26 06:00:00+00:00,67,67,67,67,67,67,70,67,65,xgboost,xgboost
+2026-08-26 05:00:00+00:00,66,72,70,73,68,69,69,67,70,linear,xgboost
+2026-08-26 06:00:00+00:00,67,71,69,70,68,69,70,67,67,linear,xgboost
 2026-08-26 07:00:00+00:00,68,68,68,68,68,68,71,68,66,xgboost,xgboost
 2026-08-26 08:00:00+00:00,69,68,68,69,69,69,72,69,66,catboost,xgboost
 2026-08-26 09:00:00+00:00,70,70,70,70,70,70,73,70,67,xgboost,xgboost
@@ -95,3 +94,4 @@ datetime,Actual_AQI,xgboost,lightgbm,catboost,rf,gb,ridge,linear,best_checkpoint
 2026-08-30 01:00:00+00:00,72,73,72,73,72,73,78,76,69,lightgbm,xgboost
 2026-08-30 02:00:00+00:00,71,72,72,73,72,72,77,75,69,xgboost,xgboost
 2026-08-30 03:00:00+00:00,71,72,72,72,72,72,77,74,69,xgboost,xgboost
+2026-08-30 04:00:00+00:00,70,71,71,71,70,71,76,73,68,rf,xgboost
